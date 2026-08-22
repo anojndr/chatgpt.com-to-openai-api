@@ -52,7 +52,24 @@ class AccountPool:
             if ident not in seen:
                 removed = self._accounts.pop(ident)
                 log.info("account removed: %s", removed.email)
-                asyncio.get_event_loop().create_task(removed.close())
+                self._schedule_close(removed)
+
+    @staticmethod
+    def _schedule_close(acct: AccountSession) -> None:
+        """Close a removed account once in-flight work drains (or immediately)."""
+
+        async def _close_when_idle():
+            for _ in range(300):  # up to 5 min, then force-close
+                if acct.inflight == 0:
+                    break
+                await asyncio.sleep(1)
+            await acct.close()
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_close_when_idle())
+        except RuntimeError:
+            pass  # no running loop (sync load at import time); GC will clean up
 
     async def watch(self) -> None:
         while True:

@@ -1,7 +1,4 @@
 fastapi
 uvicorn[standard]
-httpx
 curl_cffi>=0.7
-python-multipart
-pydantic-settings
 pillow

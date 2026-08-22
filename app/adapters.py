@@ -155,13 +155,38 @@ def decode_data_url(value: str) -> tuple[str, bytes]:
 
 async def fetch_remote(url: str) -> tuple[str, bytes]:
     from curl_cffi.requests import AsyncSession
+    import ipaddress
+    import socket as _socket
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("only http(s) image URLs are supported")
+    host = parsed.hostname or ""
+    # SSRF guard: refuse loopback/private/link-local/metadata targets.
+    bad_ip = False
+    try:
+        infos = _socket.getaddrinfo(host, None)
+        for info in infos:
+            ip = ipaddress.ip_address(info[4][0])
+            if ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                bad_ip = True
+                break
+    except _socket.gaierror as e:
+        raise ValueError(f"cannot resolve image host: {host}") from e
+    if bad_ip or host in ("localhost", "metadata.google.internal"):
+        raise ValueError("refusing to fetch image from private address")
+
     s = AsyncSession()
     try:
         r = await s.get(url, timeout=60)
         if r.status_code != 200:
             raise ValueError(f"failed to fetch {url}: HTTP {r.status_code}")
         ct = (r.headers.get("content-type") or "application/octet-stream").split(";")[0].strip().lower()
-        return ct, r.content
+        data = r.content
+        if len(data) > 25 * 1024 * 1024:
+            raise ValueError("image larger than 25 MB")
+        return ct, data
     finally:
         await s.close()
 
@@ -249,12 +274,14 @@ async def parse_chat_request(body: dict) -> ParsedRequest:
                         raise ValueError("image_url.url must be a string")
                     if url.startswith("data:"):
                         mime, data = decode_data_url(url)
+                        name = "image." + (mime.split("/")[1] if "/" in mime else "bin")
+                        item.images.append(ImageInput(name, mime, data))
                     elif url.startswith("http://") or url.startswith("https://"):
                         mime, data = await fetch_remote(url)
+                        name = url.rsplit("/", 1)[-1].split("?")[0] or "image"
+                        item.images.append(ImageInput(name, mime, data))
                     else:
                         raise ValueError("image_url must be a data or http(s) URL")
-                    name = url.rsplit("/", 1)[-1].split("?")[0] or "image"
-                    item.images.append(ImageInput(name, mime, data))
                 elif ptype == "file":
                     f = part.get("file") or {}
                     fd = f.get("file_data")
@@ -306,6 +333,7 @@ async def parse_responses_request(body: dict) -> tuple[ParsedRequest, str | None
         raise ValueError("input_image.image_url must be a data or http(s) URL")
 
     async def add_message(role: str, content: Any) -> None:
+        nonlocal system_text
         if role in ("system", "developer"):
             t = extract_text(content)
             system_text = (system_text + "\n\n" + t).strip()

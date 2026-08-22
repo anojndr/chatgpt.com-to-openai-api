@@ -143,85 +143,105 @@ async def run_turn(
              f"continue conv={ref.conversation_id}" if ref else "new conversation")
 
     preferred = ref.account_identity if ref else (preferred_email or None)
-    try:
-        acct = pool.acquire(preferred)
-    except NoAccountAvailable as e:
-        raise EngineError(503, str(e), "rate_limit_error") from e
-
+    max_attempts = 1 if ref else 3  # continuations are account-bound; fresh convs can move
     rid = response_id_prefix + uuid.uuid4().hex
-    try:
-        acct.total_requests += 1
-        live_slugs = {m.get("slug") for m in await acct.models() if m.get("slug")}
-        model = map_model(parsed.model_requested, live_slugs)
-        pointers, attachments = await _upload_inputs(acct, current)
 
-        prompt = current.text
-        if parsed.system_text and ref is None:
-            # Instructions ride once, on the first turn of a fresh conversation.
-            prompt = f"{parsed.system_text}\n\n{prompt}" if prompt else parsed.system_text
+    for attempt in range(1, max_attempts + 1):
+        try:
+            acct = pool.acquire(preferred)
+        except NoAccountAvailable as e:
+            raise EngineError(503, str(e), "rate_limit_error") from e
 
-        text_acc = ""
-        emitted = 0
-        sediment: list[str] = []
-        cid = ""
-        parent = ""
+        produced = False  # never switch accounts after content started flowing
+        try:
+            acct.total_requests += 1
+            live_slugs = {m.get("slug") for m in await acct.models() if m.get("slug")}
+            model = map_model(parsed.model_requested, live_slugs)
+            pointers, attachments = await _upload_inputs(acct, current)
 
-        async for ev in acct.stream_conversation(
-            prompt_text=prompt,
-            image_pointers=pointers,
-            attachments=attachments,
-            parent_message_id=ref.parent_id if ref else str(uuid.uuid4()),
-            conversation_id=ref.conversation_id if ref else None,
-            model=model,
-        ):
-            if ev.get("conversation_id") and not cid:
-                cid = ev["conversation_id"]
-            m = ev.get("message") or {}
-            author = m.get("author") or {}
-            if author.get("role") not in ("assistant", "tool"):
-                continue
-            content = m.get("content") or {}
-            parts = content.get("parts") or []
-            for p in parts:
-                if isinstance(p, dict):
-                    ptr = p.get("asset_pointer")
-                    if isinstance(ptr, str) and "sediment://" in ptr and ptr not in sediment:
-                        sediment.append(ptr)
-                elif isinstance(p, str) and author.get("role") == "assistant":
-                    text_acc = p
-                    if len(text_acc) > emitted:
-                        yield {"type": "delta", "text": text_acc[emitted:]}
-                        emitted = len(text_acc)
-            meta = m.get("metadata") or {}
-            if meta.get("message_type") in ("next", "continue"):
-                parent = m.get("id") or parent
+            prompt = current.text
+            if parsed.system_text and ref is None:
+                # Instructions ride once, on the first turn of a fresh conversation.
+                prompt = f"{parsed.system_text}\n\n{prompt}" if prompt else parsed.system_text
 
-        if not parent or not cid:
-            raise EngineError(502, "ChatGPT returned an incomplete response")
+            text_acc = ""
+            emitted = 0
+            current_msg_id = ""
+            sediment: list[str] = []
+            cid = ""
+            parent = ""
 
-        image_urls = await _resolve_images(acct, sediment)
-        if image_urls:
-            links = "\n\n" + "\n\n".join(f"![generated image]({u})" for u in image_urls)
-            yield {"type": "delta", "text": links}
-            text_acc += links
+            async for ev in acct.stream_conversation(
+                prompt_text=prompt,
+                image_pointers=pointers,
+                attachments=attachments,
+                parent_message_id=ref.parent_id if ref else str(uuid.uuid4()),
+                conversation_id=ref.conversation_id if ref else None,
+                model=model,
+            ):
+                if ev.get("conversation_id") and not cid:
+                    cid = ev["conversation_id"]
+                m = ev.get("message") or {}
+                author = m.get("author") or {}
+                if author.get("role") not in ("assistant", "tool"):
+                    continue
+                if author.get("role") == "assistant" and m.get("id") and m["id"] != current_msg_id:
+                    # new assistant node: restart delta accounting so its text streams
+                    current_msg_id = m["id"]
+                    emitted = 0
+                    text_acc = ""
+                content = m.get("content") or {}
+                parts = content.get("parts") or []
+                for p in parts:
+                    if isinstance(p, dict):
+                        ptr = p.get("asset_pointer")
+                        if isinstance(ptr, str) and "sediment://" in ptr and ptr not in sediment:
+                            sediment.append(ptr)
+                    elif isinstance(p, str) and author.get("role") == "assistant":
+                        text_acc = p
+                        if len(text_acc) > emitted:
+                            produced = True
+                            yield {"type": "delta", "text": text_acc[emitted:]}
+                            emitted = len(text_acc)
+                meta = m.get("metadata") or {}
+                if meta.get("message_type") in ("next", "continue"):
+                    parent = m.get("id") or parent
 
-        created = int(time.time())
-        new_ref = ConvRef(acct.identity, cid, parent, len(parsed.items), time.time())
-        STORE.record_turn(hashes, new_ref)
-        STORE.put_response(ResponseRecord(rid, acct.identity, cid, parent, model, time.time()))
-        yield {"type": "done", "result": TurnResult(
-            text=text_acc, conversation_id=cid, parent_id=parent, model=model,
-            created=created, response_id=rid, image_urls=image_urls,
-            prompt_tokens=estimate_tokens(parsed.system_text, *(x.text for x in parsed.items)),
-            completion_tokens=estimate_tokens(text_acc),
-            account_email=acct.email,
-        )}
-    except ChatGPTError as e:
-        pool.report_status(acct, e.status)
-        raise EngineError(429 if e.status == 429 else (502 if e.status >= 500 else 502), e.message,
-                          "rate_limit_error" if e.status == 429 else "server_error") from e
-    finally:
-        pool.release(acct)
+            if not parent or not cid:
+                raise EngineError(502, "ChatGPT returned an incomplete response")
+
+            image_urls = await _resolve_images(acct, sediment)
+            if image_urls:
+                links = "\n\n" + "\n\n".join(f"![generated image]({u})" for u in image_urls)
+                produced = True
+                yield {"type": "delta", "text": links}
+                text_acc += links
+
+            created = int(time.time())
+            new_ref = ConvRef(acct.identity, cid, parent, len(parsed.items), time.time())
+            STORE.record_turn(hashes, new_ref)
+            STORE.put_response(ResponseRecord(rid, acct.identity, cid, parent, model, time.time()))
+            yield {"type": "done", "result": TurnResult(
+                text=text_acc, conversation_id=cid, parent_id=parent, model=model,
+                created=created, response_id=rid, image_urls=image_urls,
+                prompt_tokens=estimate_tokens(parsed.system_text, *(x.text for x in parsed.items)),
+                completion_tokens=estimate_tokens(text_acc),
+                account_email=acct.email,
+            )}
+            return  # success
+
+        except ChatGPTError as e:
+            pool.report_status(acct, e.status)
+            if produced or attempt >= max_attempts:
+                raise EngineError(
+                    429 if e.status == 429 else (502 if e.status >= 500 else 502),
+                    e.message,
+                    "rate_limit_error" if e.status == 429 else "server_error",
+                ) from e
+            log.warning("attempt %d/%d on %s failed (%s %s); rotating account",
+                        attempt, max_attempts, acct.email, e.status, e.message[:120])
+        finally:
+            pool.release(acct)
 
 
 async def collect(parsed: ParsedRequest, pool: AccountPool, *, previous_response_id: str | None = None,

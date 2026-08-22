@@ -10,6 +10,7 @@ Protocol per account session (TLS-impersonated via curl_cffi):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -57,6 +58,8 @@ def parse_accounts_text(text: str) -> list[dict[str, Any]]:
         cookies: dict[str, str] = {}
         for line in b.splitlines():
             line = line.strip()
+            if line.startswith("#HttpOnly_"):
+                line = line[len("#HttpOnly_"):]  # standard netscape-jar HttpOnly marker
             if not line or line.startswith("#") or "\t" not in line:
                 continue
             parts = line.split("\t")
@@ -99,9 +102,12 @@ class AccountSession:
         self._scripts: list[str] = []
         self._models_cache: tuple[float, list[dict]] | None = None
         self._last_refresh_attempt: float = 0.0
+        self._closed: bool = False
 
     # ---------- http ----------
     async def http(self) -> AsyncSession:
+        if self._closed:
+            raise ChatGPTError(503, f"session for {self.email} was removed from the pool")
         if self._http is None:
             self._http = AsyncSession(impersonate=config.IMPERSONATE)
             self._http.headers.update({"User-Agent": config.USER_AGENT})
@@ -123,6 +129,7 @@ class AccountSession:
         return h
 
     async def close(self) -> None:
+        self._closed = True
         if self._http is not None:
             await self._http.close()
             self._http = None
@@ -187,9 +194,14 @@ class AccountSession:
         proof = ""
         if pw.get("required"):
             script = self._scripts[0] if self._scripts else None
-            proof = pow_solver.solve(pw.get("seed", ""), pw.get("difficulty", "0"),
-                                     script=script, build_id=self._build_id or None,
-                                     user_agent=config.USER_AGENT)
+            try:
+                # CPU-bound: keep the event loop free for other accounts' streams.
+                proof = await asyncio.to_thread(
+                    pow_solver.solve, pw.get("seed", ""), pw.get("difficulty", "0"),
+                    script=script, build_id=self._build_id or None,
+                    user_agent=config.USER_AGENT)
+            except RuntimeError as e:
+                raise ChatGPTError(503, str(e))
         ttl = int(j.get("expire_after") or config.REQUIREMENTS_TTL)
         self._req = Requirements(token=j.get("token", ""), proof=proof, expires_at=now + min(ttl, config.REQUIREMENTS_TTL))
         return self._req
@@ -251,51 +263,58 @@ class AccountSession:
             body["conversation_id"] = conversation_id
         s = await self.http()
         r = None
-        for attempt in (0, 1):  # one retry with a fresh token if sentinel rejects
-            req = await self.requirements(force=True)
-            r = await s.post(
-                f"{CHATGPT_ORIGIN}/backend-api/conversation",
-                headers={
-                    **self.base_headers(),
-                    "Content-Type": "application/json",
-                    "Origin": CHATGPT_ORIGIN,
-                    "Referer": f"{CHATGPT_ORIGIN}/",
-                    "Openai-Sentinel-Chat-Requirements-Token": req.token,
-                    "Openai-Sentinel-Proof-Token": req.proof,
-                },
-                json=body,
-                stream=True,
-                timeout=300,
-            )
-            if r.status_code == 403 and attempt == 0:
-                log.warning("[%s] conversation 403, retrying with fresh sentinel token", self.email)
-                continue
-            break
-        if r.status_code == 401:
-            if await self.refresh_access_token():
-                raise ChatGPTError(401, "token refreshed; retry")
-            raise ChatGPTError(401, "unauthorized")
-        if r.status_code == 429:
-            detail = r.text[:300]
-            raise ChatGPTError(429, detail)
-        if r.status_code == 403:
-            self._req = None  # sentinel may be stale
-            raise ChatGPTError(403, r.text[:300])
-        if r.status_code != 200:
-            raise ChatGPTError(r.status_code, r.text[:500])
-        async for raw in r.aiter_lines():
-            if not isinstance(raw, str):
-                raw = raw.decode()
-            if not raw.startswith("data: "):
-                continue
-            payload = raw[6:].strip()
-            if payload == "[DONE]":
-                yield {"type": "done"}
+        try:
+            for attempt in (0, 1, 2):  # 403: fresh sentinel token; 401: refresh token
+                req = await self.requirements(force=True)
+                r = await s.post(
+                    f"{CHATGPT_ORIGIN}/backend-api/conversation",
+                    headers={
+                        **self.base_headers(),
+                        "Content-Type": "application/json",
+                        "Origin": CHATGPT_ORIGIN,
+                        "Referer": f"{CHATGPT_ORIGIN}/",
+                        "Openai-Sentinel-Chat-Requirements-Token": req.token,
+                        "Openai-Sentinel-Proof-Token": req.proof,
+                    },
+                    json=body,
+                    stream=True,
+                    timeout=300,
+                )
+                if r.status_code == 403 and attempt < 2:
+                    await r.aclose()
+                    log.warning("[%s] conversation 403, retrying with fresh sentinel token", self.email)
+                    continue
+                if r.status_code == 401 and attempt < 2 and await self.refresh_access_token():
+                    await r.aclose()
+                    log.warning("[%s] conversation 401, retried after token refresh", self.email)
+                    continue
                 break
-            try:
-                yield json.loads(payload)
-            except json.JSONDecodeError:
-                continue
+            if r.status_code == 429:
+                raise ChatGPTError(429, r.text[:300])
+            if r.status_code == 403:
+                raise ChatGPTError(403, r.text[:300])
+            if r.status_code == 401:
+                raise ChatGPTError(401, "unauthorized")
+            if r.status_code != 200:
+                raise ChatGPTError(r.status_code, r.text[:500])
+            async for raw in r.aiter_lines():
+                if not isinstance(raw, str):
+                    raw = raw.decode()
+                if not raw.startswith("data: "):
+                    continue
+                payload = raw[6:].strip()
+                if payload == "[DONE]":
+                    yield {"type": "done"}
+                    break
+                try:
+                    yield json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+        finally:
+            # covers retry abandonment, error raises, [DONE] breaks, and client disconnects
+            if r is not None:
+                with contextlib.suppress(Exception):
+                    await r.aclose()
 
     # ---------- models ----------
     async def models(self) -> list[dict[str, Any]]:
