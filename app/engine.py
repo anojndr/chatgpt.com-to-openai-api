@@ -12,6 +12,7 @@ import logging
 import re
 import time
 import uuid
+import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 
@@ -108,6 +109,130 @@ def _classify_accumulated(text: str) -> tuple[int, bool]:
         if i == n:  # consumed the whole text within this opening
             return 0, False
     return len(text), False  # diverged from every opening -> cannot be the refusal
+
+
+# ChatGPT web-search citations arrive as private-use-area delimited markers
+# embedded in the assistant text itself:
+#   "\ue200cite\ue202turn0search0\ue202turn0search5\ue201"
+# The referenced sources ride alongside in message.metadata:
+#   - search_result_groups[].entries[] carry an explicit ref_id
+#     {turn_index, ref_type, ref_index} matching each marker token;
+#   - grouped_webpages content_references pair their refs[] positionally with
+#     [url] + supporting_websites[].url (the same index space).
+# Markers are rewritten to titled markdown links before anything is streamed;
+# a block whose sources have not arrived yet is withheld until it resolves,
+# and dropped at end of turn if its sources never show up. URLs lose utm_*
+# tracking parameters so clients see clean links.
+_CITE_BLOCK_RE = re.compile("\ue200cite(?:\ue202turn\\d+[a-z]+\\d+)+\ue201")
+_CITE_TOKEN_RE = re.compile(r"turn(\d+)([a-z]+)(\d+)")
+
+
+def _cite_map_extend(cmap: dict[tuple[int, str, int], dict], meta: Any) -> None:
+    """Merge one SSE event's citation sources into the per-turn map."""
+    if not isinstance(meta, dict):
+        return
+    for group in meta.get("search_result_groups") or []:
+        for entry in group.get("entries") or []:
+            ref = entry.get("ref_id") or {}
+            url = entry.get("url")
+            key = (ref.get("turn_index"), ref.get("ref_type"), ref.get("ref_index"))
+            if url and all(v is not None for v in key):
+                cmap.setdefault(key, {"url": url, "title": entry.get("title"),
+                                      "attr": entry.get("attribution")})
+    for cr in meta.get("content_references") or []:
+        if cr.get("type") != "grouped_webpages":
+            continue
+        for item in cr.get("items") or []:
+            sources = [{"url": item.get("url"), "title": item.get("title"),
+                        "attr": item.get("attribution")}]
+            sources += [{"url": s.get("url"), "title": s.get("title"),
+                         "attr": s.get("attribution")}
+                        for s in item.get("supporting_websites") or []]
+            for ref, src in zip(item.get("refs") or [], sources):
+                key = (ref.get("turn_index"), ref.get("ref_type"), ref.get("ref_index"))
+                if src.get("url") and all(v is not None for v in key):
+                    cmap.setdefault(key, src)
+
+
+def _clean_url(url: str) -> str:
+    """Drop utm_* tracking parameters; keep everything else byte-faithful."""
+    # Split the raw query instead of round-tripping through parse_qsl:
+    # re-encoding survivors corrupts values (semicolon pairs collapse,
+    # invalid-UTF-8 escapes get replaced, %20 becomes '+').
+    parts = urllib.parse.urlsplit(url)
+    kept = [pair for pair in parts.query.split("&") if not urllib.parse.unquote_plus(
+        pair.partition("=")[0]).lower().startswith("utm_")] if parts.query else []
+    out = urllib.parse.urlunsplit(parts._replace(query="&".join(kept)))
+    # () would terminate a markdown link early; keep them percent-encoded
+    return out.replace("(", "%28").replace(")", "%29").replace(" ", "%20")
+
+
+def _format_source(src: dict) -> str:
+    """One citation as [label](url); label falls back to attribution/domain."""
+    url = _clean_url(src["url"])
+    label = " ".join((src.get("title") or "").split())
+    if not label:
+        label = " ".join((src.get("attr") or "").split())
+    if not label:
+        netloc = urllib.parse.urlsplit(src["url"]).netloc
+        label = netloc[4:] if netloc.startswith("www.") else netloc
+        if not label:
+            return url
+    # brackets would break markdown link text in renderers without \-escape
+    # support (e.g. Discord); swap them out instead of escaping
+    return f"[{label.replace('[', '(').replace(']', ')')}]({url})"
+
+
+def _render_citations(raw: str, cmap: dict[tuple[int, str, int], dict], *,
+                      final: bool = False) -> tuple[str, int]:
+    """Rewrite citation-marker blocks in one cumulative text snapshot to links.
+
+    Returns (rendered_text, safe_len). safe_len bounds the prefix that is
+    provably stable: complete blocks with still-unresolved tokens hold the
+    stream at their start (their bytes would change once sources arrive);
+    a trailing half-received block holds likewise. With final=True the stream
+    is over -- unresolved tokens are dropped instead of held.
+    """
+    out: list[str] = []
+    pos = 0
+    safe = 0
+    hold = -1  # display index from which output may still change
+    for m in _CITE_BLOCK_RE.finditer(raw):
+        gap = raw[pos:m.start()]
+        out.append(gap)
+        if hold < 0:
+            safe += len(gap)
+        pos = m.end()
+        tokens = _CITE_TOKEN_RE.findall(m.group(0))
+        sources = [cmap.get((int(t), rt, int(n))) for t, rt, n in tokens]
+        resolved = [s for s in sources if s]
+        piece = ""
+        if len(resolved) == len(tokens) or final:
+            piece = " ".join(_format_source(s) for s in resolved)
+        elif hold < 0:
+            hold = safe  # withhold this block (and everything after it)
+        out.append(piece)
+        if hold < 0:
+            safe += len(piece)
+    tail = raw[pos:]
+    if tail:
+        # A trailing \ue200 may be a half-received marker (withhold mid-stream)
+        # or content we simply cannot parse -- at end of stream never discard
+        # past it, or real text after it would silently vanish.
+        cut = -1 if hold >= 0 or final else tail.find("\ue200")
+        if cut >= 0:  # half-received trailing block: withhold it
+            out.append(tail[:cut])
+            if hold < 0:
+                safe += cut
+                hold = safe
+        else:
+            out.append(tail)
+            if hold < 0:
+                safe += len(tail)
+    text = "".join(out)
+    if final:
+        return text, len(text)
+    return text, min(safe, len(text))
 
 
 
@@ -323,6 +448,7 @@ async def run_turn(
 
             text_acc = ""
             emitted = 0
+            cite_map: dict[tuple[int, str, int], dict] = {}
             current_msg_id = ""
             sediment: list[str] = []
             cid = ""
@@ -345,6 +471,7 @@ async def run_turn(
                 if ev.get("conversation_id") and not cid:
                     cid = ev["conversation_id"]
                 m = ev.get("message") or {}
+                _cite_map_extend(cite_map, m.get("metadata"))
                 author = m.get("author") or {}
                 if m.get("id"):
                     last_node_id = m["id"]
@@ -370,10 +497,11 @@ async def run_turn(
                         if is_limit:
                             limit_hit = True
                             break
-                        if emit_upto > emitted:
+                        display, safe_upto = _render_citations(text_acc, cite_map)
+                        if emit_upto > 0 and safe_upto > emitted:
                             produced = True
-                            yield {"type": "delta", "text": text_acc[emitted:emit_upto]}
-                            emitted = emit_upto
+                            yield {"type": "delta", "text": display[emitted:safe_upto]}
+                            emitted = safe_upto
                 if limit_hit:
                     break
                 meta = m.get("metadata") or {}
@@ -404,11 +532,13 @@ async def run_turn(
                 # to the last node we saw (the tool node) instead of "".
                 parent = last_node_id
             # Flush anything still withheld first: short normal replies that
-            # begin like the refusal must reach the client in full.
-            if emitted < len(text_acc):
+            # begin like the refusal must reach the client in full. final=True
+            # also releases citation blocks whose sources never arrived.
+            display, _ = _render_citations(text_acc, cite_map, final=True)
+            if emitted < len(display):
                 produced = True
-                yield {"type": "delta", "text": text_acc[emitted:]}
-                emitted = len(text_acc)
+                yield {"type": "delta", "text": display[emitted:]}
+            text_acc = display
 
             image_urls = await _resolve_images(acct, sediment)
             if image_urls:
