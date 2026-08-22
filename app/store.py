@@ -56,19 +56,13 @@ class ConversationStore:
         self._responses: dict[str, ResponseRecord] = {}
 
     # ---------- chat-completions style ----------
-    def find(self, hashes: list[str]) -> tuple[str, ConvRef] | None:
+    def find(self, hashes: list[str]) -> tuple[int, ConvRef] | None:
         """Longest prefix match. Returns (matched_len, ref)."""
-        best: tuple[int, ConvRef] | None = None
         for k in range(len(hashes), 0, -1):
             ref = self._prefixes.get(hashes[k - 1])
-            if ref is None:
-                # guard against hash collisions across chains
-                continue
-            if best is None or k > best[0]:
-                best = (k, ref)
-            if k == len(hashes):
-                break
-        return best
+            if ref is not None:
+                return (k, ref)  # first hit scanning from longest = best match
+        return None
 
     def record_turn(self, hashes: list[str], ref: ConvRef) -> None:
         """Store hash chain entries covering the whole updated history."""

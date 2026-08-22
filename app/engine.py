@@ -157,6 +157,7 @@ async def run_turn(
             acct.total_requests += 1
             live_slugs = {m.get("slug") for m in await acct.models() if m.get("slug")}
             model = map_model(parsed.model_requested, live_slugs)
+            yield {"type": "model", "model": model}
             pointers, attachments = await _upload_inputs(acct, current)
 
             prompt = current.text

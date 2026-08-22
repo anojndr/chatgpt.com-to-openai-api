@@ -101,15 +101,19 @@ async def chat_stream(parsed, include_usage: bool, preferred: str | None = None)
     first = True
     try:
         async for ev in run_turn(parsed, POOL, preferred_email=preferred):
-            if ev["type"] == "delta":
+            if ev["type"] == "model":
+                model = ev["model"]  # resolved live slug, stamped on every chunk
+            elif ev["type"] == "delta":
                 t = ev["text"]
+                # first chunk carries role + any initial content (never drop text)
+                delta = ({"role": "assistant", "content": t} if first else {"content": t})
                 chunk = {
                     "id": cid,
                     "object": "chat.completion.chunk",
                     "created": created,
                     "model": model,
                     "system_fingerprint": None,
-                    "choices": [{"index": 0, "delta": ({"role": "assistant", "content": ""} if first else {"content": t}),
+                    "choices": [{"index": 0, "delta": delta,
                                  "logprobs": None, "finish_reason": None}],
                 }
                 first = False
@@ -252,9 +256,12 @@ async def responses_stream(parsed, prev, preferred: str | None = None):
 
     text_acc = ""
     result = None
+    model = parsed.model_requested or "auto"
     try:
         async for e in run_turn(parsed, POOL, previous_response_id=prev, response_id_prefix="resp_", preferred_email=preferred):
-            if e["type"] == "delta":
+            if e["type"] == "model":
+                model = e["model"]
+            elif e["type"] == "delta":
                 text_acc += e["text"]
                 yield ev("response.output_text.delta", item_id=msg_id, output_index=0, content_index=0,
                          delta=e["text"], logprobs=[], obfuscation=None)
