@@ -390,9 +390,13 @@ async def run_turn(
             # sediment pointer -- no assistant message, no "next" marker. Such a
             # turn is complete: its product is the generated image.
             if not cid or (not parent and not sediment):
-                # Bare "incomplete" hides whether ChatGPT errored, moderated, or
-                # just stopped early; surface the final event for diagnosis.
-                tail = (f"; last SSE event: {str(last_event)[:200]}"
+                # Full frame goes to the server log only; the client-facing
+                # error keeps just the event type so session-scoped tokens and
+                # ids never leave the process.
+                if last_event:
+                    log.warning("incomplete stream on %s: last SSE event %s",
+                                acct.email, str(last_event)[:500])
+                tail = (f"; last SSE event type: {last_event.get('type', '?')}"
                         if last_event else "; stream ended without any events")
                 raise EngineError(502, "ChatGPT returned an incomplete response" + tail)
             if not parent:
