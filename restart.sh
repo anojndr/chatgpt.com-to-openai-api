@@ -39,5 +39,5 @@ echo
 echo "Base URL (copy & paste):"
 echo "  $BASE_URL"
 echo
-echo "tailing $LOG  (Ctrl-C to stop watching; server keeps running)"
-tail -f "$LOG"
+echo "Follow logs (copy & paste):"
+echo "  tail -f $LOG"
