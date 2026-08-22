@@ -328,6 +328,8 @@ async def run_turn(
             cid = ""
             parent = ""
             limit_hit = False
+            last_event: dict[str, Any] = {}
+            last_node_id = ""
 
             async for ev in acct.stream_conversation(
                 prompt_text=prompt,
@@ -339,10 +341,13 @@ async def run_turn(
                 conversation_id=ref.conversation_id if continuing else None,
                 model=model,
             ):
+                last_event = ev
                 if ev.get("conversation_id") and not cid:
                     cid = ev["conversation_id"]
                 m = ev.get("message") or {}
                 author = m.get("author") or {}
+                if m.get("id"):
+                    last_node_id = m["id"]
                 if author.get("role") not in ("assistant", "tool"):
                     continue
                 if author.get("role") == "assistant" and m.get("id") and m["id"] != current_msg_id:
@@ -380,9 +385,20 @@ async def run_turn(
             if limit_hit or (text_acc and IMAGE_LIMIT_RE.search(text_acc)):
                 raise _ImageLimitError(text_acc.strip()[:300])
 
-            if not parent or not cid:
-                raise EngineError(502, "ChatGPT returned an incomplete response")
-
+            
+            # Image-generation turns can end with ONLY a tool node carrying the
+            # sediment pointer -- no assistant message, no "next" marker. Such a
+            # turn is complete: its product is the generated image.
+            if not cid or (not parent and not sediment):
+                # Bare "incomplete" hides whether ChatGPT errored, moderated, or
+                # just stopped early; surface the final event for diagnosis.
+                tail = (f"; last SSE event: {str(last_event)[:200]}"
+                        if last_event else "; stream ended without any events")
+                raise EngineError(502, "ChatGPT returned an incomplete response" + tail)
+            if not parent:
+                # Keep the stored conversation continuable: parent the next turn
+                # to the last node we saw (the tool node) instead of "".
+                parent = last_node_id
             # Flush anything still withheld first: short normal replies that
             # begin like the refusal must reach the client in full.
             if emitted < len(text_acc):

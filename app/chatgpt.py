@@ -149,6 +149,16 @@ class AccountSession:
                 self.dead = True
                 log.warning("[%s] session cookie expired (no accessToken)", self.email)
                 return False
+            new_exp = _jwt_exp(new_at)
+            if not new_exp or new_exp <= time.time() + 60:
+                # /api/auth/session can keep serving a cached token past its exp
+                # when the session cookie itself is stale. Storing it would log
+                # "refreshed" while every Bearer-gated call keeps 401-ing.
+                log.warning("[%s] session returned an %s access token (%ss left); "
+                            "account needs re-login for bearer-authenticated calls",
+                            self.email, "unparseable" if not new_exp else "expired",
+                            max(0.0, (new_exp or 0.0) - time.time()))
+                return False
             self.access_token = new_at
             self._jwt_exp = _jwt_exp(new_at)
             self.session_json = j
@@ -338,10 +348,19 @@ class AccountSession:
     async def upload_file(self, name: str, data: bytes, mime: str, *, is_image: bool) -> str:
         use_case = "multimodal" if is_image else "ace_upload"
         await self.ensure_token()
+        headers = {**self.base_headers(), "Content-Type": "application/json"}
+        # /files/{id}/uploaded rejects cookie-only auth: create + blob PUT succeed
+        # without a Bearer but finalize always 401s, so fail fast instead.
+        if "Authorization" not in headers:
+            raise ChatGPTError(
+                401,
+                f"[{self.email}] access token expired and refresh cannot renew it "
+                f"(stale session cookie); re-login this account to upload files",
+            )
         s = await self.http()
         r = await s.post(
             f"{CHATGPT_ORIGIN}/backend-api/files",
-            headers={**self.base_headers(), "Content-Type": "application/json"},
+            headers=headers,
             json={"file_name": name, "file_size": len(data), "use_case": use_case},
             timeout=60,
         )
@@ -358,7 +377,7 @@ class AccountSession:
             raise ChatGPTError(put.status_code, f"blob upload failed: {put.status_code}")
         done = await s.post(
             f"{CHATGPT_ORIGIN}/backend-api/files/{file_id}/uploaded",
-            headers={**self.base_headers(), "Content-Type": "application/json"},
+            headers=headers,
             json={}, timeout=60,
         )
         if done.status_code != 200:
@@ -372,7 +391,10 @@ class AccountSession:
             r = await s.get(f"{CHATGPT_ORIGIN}/backend-api/files/{file_id}",
                             headers=self.base_headers(), timeout=30)
             if r.status_code == 200:
-                st = r.json().get("status")
+                # The endpoint moved the processing flag from "status" to
+                # "state"; read either so the poll can actually observe it.
+                j = r.json()
+                st = j.get("status") or j.get("state")
                 if st in ("success", "ready"):
                     return True
                 if st == "error":
