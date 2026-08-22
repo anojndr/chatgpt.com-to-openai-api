@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -45,6 +46,68 @@ class EngineError(Exception):
         self.status = status
         self.message = message
         self.error_type = error_type
+
+class _ImageLimitError(Exception):
+    """The model replied with a per-account image-generation quota refusal.
+
+    Raised BEFORE any byte reaches the client, so the failover loop may serve
+    the same request on another account.
+    """
+
+
+# Matches e.g. "You've hit the Free plan limit for image generations requests.
+# You can create more images when the limit resets in 9 hours and 38 minutes."
+# Plan name and reset time vary; the fixed head/tail phrases do not.
+
+
+# Anchored to the reply head (<=64 lead-in chars) so a reply that merely QUOTES
+# the template mid-text is never mistaken for a refusal.
+
+# Anchored to the very head of the reply (only whitespace/bullet/markdown
+# flourish may precede it), so a reply that merely QUOTES the template
+# mid-text -- even after a short prose lead-in -- is never mistaken for one.
+IMAGE_LIMIT_RE = re.compile(
+    r"\A[\s>*#\-`]{0,16}you(?:'ve| have)\s+hit\s+(?:the|your)\s+"
+    r".*?plan\s+limit\s+for\s+image\s+generations?\s+requests",
+    re.IGNORECASE | re.DOTALL,
+)
+_LIMIT_STARTERS = ("you've hit the ", "you have hit the ", "you've hit your ")
+_PLAN_WORDS = ("free", "plus", "pro", "team", "enterprise")
+_LIMIT_MAX_LEN = 220  # refusal sentences stay well under this; longer text can't be one
+
+
+def _classify_accumulated(text: str) -> tuple[int, bool]:
+    """Decide how much of the buffered assistant text is safe to stream.
+
+    Returns (chars_safe_to_emit_now, is_image_limit_refusal). While the text
+    could still grow into the quota refusal, nothing is released; the moment
+    it diverges from every refusal opening (or exceeds plausible length), the
+    whole buffer is released so normal streaming is never visibly delayed.
+    """
+    if IMAGE_LIMIT_RE.search(text):
+        return 0, True
+    if len(text) > _LIMIT_MAX_LEN:
+        return len(text), False
+    low = text.lower()
+    for starter in _LIMIT_STARTERS:
+        if low.startswith(starter):
+            # Fixed head matched; only a plan-name-looking next word can
+            # still grow into the refusal ("Free"/"Plus"/...).
+            rest = low[len(starter):]
+            m = re.match(r"[a-z]+", rest)
+            word = m.group(0) if m else ""
+            if not word or any(w.startswith(word) or word.startswith(w) for w in _PLAN_WORDS):
+                return 0, False
+            return len(text), False  # "You've hit the nail..." -> normal reply
+    # Still compatible with some refusal opening? Hold until it diverges.
+    for starter in _LIMIT_STARTERS:
+        n = min(len(low), len(starter))
+        i = 0
+        while i < n and low[i] == starter[i]:
+            i += 1
+        if i == n:  # consumed the whole text within this opening
+            return 0, False
+    return len(text), False  # diverged from every opening -> cannot be the refusal
 
 
 
@@ -264,6 +327,7 @@ async def run_turn(
             sediment: list[str] = []
             cid = ""
             parent = ""
+            limit_hit = False
 
             async for ev in acct.stream_conversation(
                 prompt_text=prompt,
@@ -295,16 +359,36 @@ async def run_turn(
                             sediment.append(ptr)
                     elif isinstance(p, str) and author.get("role") == "assistant":
                         text_acc = p
-                        if len(text_acc) > emitted:
+                        # Withhold bytes while they could still be the image-limit
+                        # refusal: once visible, accounts can no longer be switched.
+                        emit_upto, is_limit = _classify_accumulated(text_acc)
+                        if is_limit:
+                            limit_hit = True
+                            break
+                        if emit_upto > emitted:
                             produced = True
-                            yield {"type": "delta", "text": text_acc[emitted:]}
-                            emitted = len(text_acc)
+                            yield {"type": "delta", "text": text_acc[emitted:emit_upto]}
+                            emitted = emit_upto
+                if limit_hit:
+                    break
                 meta = m.get("metadata") or {}
                 if meta.get("message_type") in ("next", "continue"):
                     parent = m.get("id") or parent
 
+            # Refusals are valid HTTP-200 streams and may intentionally stop
+            # before ChatGPT emits the normal assistant "next" marker.
+            if limit_hit or (text_acc and IMAGE_LIMIT_RE.search(text_acc)):
+                raise _ImageLimitError(text_acc.strip()[:300])
+
             if not parent or not cid:
                 raise EngineError(502, "ChatGPT returned an incomplete response")
+
+            # Flush anything still withheld first: short normal replies that
+            # begin like the refusal must reach the client in full.
+            if emitted < len(text_acc):
+                produced = True
+                yield {"type": "delta", "text": text_acc[emitted:]}
+                emitted = len(text_acc)
 
             image_urls = await _resolve_images(acct, sediment)
             if image_urls:
@@ -341,7 +425,14 @@ async def run_turn(
         except Exception as e:
             if isinstance(e, EngineError) and e.error_type == "invalid_request_error":
                 raise  # deterministic request problem; no account can serve it
-            if isinstance(e, ChatGPTError):
+            if isinstance(e, _ImageLimitError):
+                # Per-account image quota refusal delivered as a normal 200
+                # stream. Nothing was shown to the client, so another account
+                # may still serve this request; cool this one down like a 429.
+                pool.report_status(acct, 429)
+                failure = EngineError(429, str(e), "rate_limit_error")
+
+            elif isinstance(e, ChatGPTError):
                 pool.report_status(acct, e.status)
                 failure = EngineError(
                     429 if e.status == 429 else 502,

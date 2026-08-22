@@ -41,6 +41,7 @@ account 2:
 - Add or remove blocks while the server runs — the pool hot-reloads within ~2 s (dedup by user id).
 - Load balancing: fair least-in-flight / least-recently-used rotation across ALL accounts; 429s put an account on cooldown (free 15 min, plus 2 min).
 - Failover: if a request fails on one account (429/403/5xx/transport error), EVERY other available account is tried exactly once before an error is returned. Attempts served by a different account rebuild the full conversation from scratch (see "Multi-turn design"), so nothing is lost — text, images, and binary files alike are replayed onto the account that actually serves the turn.
+- Image-limit refusals: when ChatGPT answers with "You've hit the ... plan limit for image generations requests ...", that account is put on cooldown like a 429 and the request is retried on the next available account — before any of the refusal text reaches your client. Only if every account is image-limited does the request fail (429), carrying the last refusal message.
 - Session cookies authenticate backend-api even when the embedded access-token JWT has expired; tokens refresh opportunistically via `/api/auth/session`.
 - For tests you can pin an account with header `x-chatgpt-account: <email>`.
 
@@ -69,6 +70,13 @@ account-scoped. Only after all available accounts have been tried does the
 request fail, carrying the last underlying error. Output already streamed to
 the client is never duplicated: once a delta has been emitted, no further
 account switching happens.
+Image-generation quota refusals ("You've hit the Free plan limit for image
+generations requests...") are detected inside the stream and withheld from the
+
+client while the reply could still be such a refusal (normally a few
+characters of added latency, at most ~220 while divergence is unproven); a
+matching reply rotates to the next account instead of being delivered. Replies that merely begin similarly ("You've hit the nail on
+the head!") stream normally.
 ### Files
 
 - Text-like inputs (`.py .json .txt .md .csv ...`) are inlined as fenced code blocks — fastest path.
