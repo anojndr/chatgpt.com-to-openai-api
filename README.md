@@ -40,6 +40,7 @@ account 2:
 
 - Add or remove blocks while the server runs — the pool hot-reloads within ~2 s (dedup by user id).
 - Load balancing: fair least-in-flight / least-recently-used rotation across ALL accounts; 429s put an account on cooldown (free 15 min, plus 2 min).
+- Failover: if a request fails on one account (429/403/5xx/transport error), EVERY other available account is tried exactly once before an error is returned. Attempts served by a different account rebuild the full conversation from scratch (see "Multi-turn design"), so nothing is lost — text, images, and binary files alike are replayed onto the account that actually serves the turn.
 - Session cookies authenticate backend-api even when the embedded access-token JWT has expired; tokens refresh opportunistically via `/api/auth/session`.
 - For tests you can pin an account with header `x-chatgpt-account: <email>`.
 
@@ -57,6 +58,17 @@ account 2:
 
 Requests that resend full history are matched against stored hash-chain prefixes; only the NEW trailing message is forwarded to ChatGPT and the real server-side conversation continues (`conversation_id` + `parent_message_id`). Logs show e.g. `turn plan: history=3 matched=1 continue conv=...`. `previous_response_id` maps to the same registry.
 
+**Account failover & context preservation.** Each response records a snapshot of
+the complete client-visible context (every turn's text plus its images/files,
+capped per response and store-wide via `SNAPSHOT_FILE_CAP_MB` /
+`SNAPSHOT_STORE_CAP_MB`). If the owning account fails mid-request, the next
+available account serves the turn in a brand-new conversation: prior turns are
+rendered into the prompt (`[user]` / `[assistant]` blocks, system included)
+and every attachment is re-uploaded to that account, because uploads are
+account-scoped. Only after all available accounts have been tried does the
+request fail, carrying the last underlying error. Output already streamed to
+the client is never duplicated: once a delta has been emitted, no further
+account switching happens.
 ### Files
 
 - Text-like inputs (`.py .json .txt .md .csv ...`) are inlined as fenced code blocks — fastest path.

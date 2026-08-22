@@ -32,6 +32,11 @@ COOLDOWN_FREE_SECONDS: int = int(os.environ.get("COOLDOWN_FREE_SECONDS", "900"))
 COOLDOWN_PLUS_SECONDS: int = int(os.environ.get("COOLDOWN_PLUS_SECONDS", "120"))
 REQUIREMENTS_TTL: int = int(os.environ.get("REQUIREMENTS_TTL", "480"))  # server says 540
 CONVERSATION_TTL_HOURS: float = float(os.environ.get("CONVERSATION_TTL_HOURS", "168"))
+# Context snapshots retained per response so account failover can replay the
+# full conversation (text + binaries) on another account. Per-response cap
+# bounds one snapshot's binaries; the store-wide budget evicts oldest first.
+SNAPSHOT_FILE_CAP_MB: int = int(os.environ.get("SNAPSHOT_FILE_CAP_MB", "32"))
+SNAPSHOT_STORE_CAP_MB: int = int(os.environ.get("SNAPSHOT_STORE_CAP_MB", "256"))
 
 USER_AGENT: str = os.environ.get(
     "UA",

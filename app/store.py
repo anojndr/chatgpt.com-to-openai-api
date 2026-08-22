@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import hashlib
 import time
+from copy import copy
 from dataclasses import dataclass
 from typing import Any
 
 from . import config
+from .adapters import HistoryItem
 
 
 def item_hash(prev: str, role: str, canon: str) -> str:
@@ -41,6 +43,50 @@ class ConvRef:
 
 
 @dataclass
+class TurnSnapshot:
+    """Full client-visible context of one completed turn.
+
+    Retained so a later previous_response_id call can rebuild the entire
+    conversation -- every turn's text plus its images and file attachments --
+    on ANY account if the owning account fails. Items share parse-time binary
+    buffers and are treated as read-only; trimming never mutates them.
+    """
+    system_text: str
+    items: list[HistoryItem]
+
+    def payload_bytes(self) -> int:
+        return sum(len(im.data) for it in self.items for im in it.images) \
+            + sum(len(f.data) for it in self.items for f in it.files)
+
+
+def _trim_snapshot(snap: TurnSnapshot, cap_bytes: int) -> TurnSnapshot:
+    """Drop largest binaries until under cap. Text is always kept whole."""
+    if snap.payload_bytes() <= cap_bytes:
+        return snap
+    sized: list[tuple[int, int, str, int]] = []  # (size, item_idx, kind, part_idx)
+    for ii, it in enumerate(snap.items):
+        for ki, im in enumerate(it.images):
+            sized.append((len(im.data), ii, "img", ki))
+        for kf, f in enumerate(it.files):
+            sized.append((len(f.data), ii, "file", kf))
+    sized.sort(reverse=True)
+    drop: set[tuple[int, str, int]] = set()
+    total = snap.payload_bytes()
+    for size, ii, kind, idx in sized:
+        if total <= cap_bytes:
+            break
+        total -= size
+        drop.add((ii, kind, idx))
+    out: list[HistoryItem] = []
+    for ii, it in enumerate(snap.items):
+        ni = copy(it)
+        ni.images = [im for k, im in enumerate(it.images) if (ii, "img", k) not in drop]
+        ni.files = [f for k, f in enumerate(it.files) if (ii, "file", k) not in drop]
+        out.append(ni)
+    return TurnSnapshot(system_text=snap.system_text, items=out)
+
+
+@dataclass
 class ResponseRecord:
     response_id: str
     account_identity: str
@@ -48,12 +94,14 @@ class ResponseRecord:
     parent_id: str  # parent for the NEXT turn (assistant msg id of this response)
     model: str
     created: float
+    snapshot: TurnSnapshot | None = None
 
 
 class ConversationStore:
     def __init__(self):
         self._prefixes: dict[str, ConvRef] = {}
         self._responses: dict[str, ResponseRecord] = {}
+        self._snap_bytes: int = 0
 
     # ---------- chat-completions style ----------
     def find(self, hashes: list[str]) -> tuple[int, ConvRef] | None:
@@ -75,14 +123,34 @@ class ConversationStore:
             self._prefixes = {h: r for h, r in self._prefixes.items() if r.updated >= cutoff}
 
     # ---------- responses API ----------
-    def put_response(self, rec: ResponseRecord) -> None:
+    def put_response(self, rec: ResponseRecord, snapshot: TurnSnapshot | None = None) -> None:
+        if snapshot is not None:
+            rec.snapshot = _trim_snapshot(snapshot, config.SNAPSHOT_FILE_CAP_MB << 20)
+            self._snap_bytes += rec.snapshot.payload_bytes()
         self._responses[rec.response_id] = rec
+        budget = config.SNAPSHOT_STORE_CAP_MB << 20
+        if self._snap_bytes > budget:
+            for old in self._responses.values():  # insertion order: oldest first
+                if old.snapshot is None:
+                    continue
+                self._snap_bytes -= old.snapshot.payload_bytes()
+                old.snapshot = None
+                if self._snap_bytes <= budget:
+                    break
         if len(self._responses) > 5000:
             cutoff = time.time() - config.CONVERSATION_TTL_HOURS * 3600
+            stale = {k: v for k, v in self._responses.items() if v.created < cutoff}
+            for old in stale.values():
+                if old.snapshot is not None:
+                    self._snap_bytes -= old.snapshot.payload_bytes()
             self._responses = {k: v for k, v in self._responses.items() if v.created >= cutoff}
 
     def get_response(self, response_id: str) -> ResponseRecord | None:
         return self._responses.get(response_id)
+
+    def get_snapshot(self, response_id: str) -> TurnSnapshot | None:
+        rec = self._responses.get(response_id)
+        return rec.snapshot if rec else None
 
 
 STORE = ConversationStore()

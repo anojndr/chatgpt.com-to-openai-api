@@ -99,14 +99,22 @@ class AccountPool:
             a = next((x for x in self._accounts.values() if x.email.lower() == key.lower()), None)
         return a
 
-    def acquire(self, preferred_identity: str | None = None) -> AccountSession:
-        if preferred_identity:
+    def acquire(self, preferred_identity: str | None = None,
+                exclude: frozenset[str] | set[str] = frozenset()) -> AccountSession:
+        """Acquire an account, never returning one whose identity is excluded.
+
+        Used by the engine's failover loop to walk every available account
+        exactly once before giving up.
+        """
+        if preferred_identity and preferred_identity not in exclude:
             a = self._find(preferred_identity)
             if a and not a.dead and a.cooldown_until <= time.time():
                 a.inflight += 1
                 a.last_used = time.time()
                 return a
-        cands = self.available()
+        now = time.time()
+        cands = [a for a in self._accounts.values()
+                 if not a.dead and a.cooldown_until <= now and a.identity not in exclude]
         if not cands:
             raise NoAccountAvailable()
         cands.sort(key=lambda a: (a.inflight, a.last_used))
