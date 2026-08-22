@@ -1,0 +1,12 @@
+# secrets & credentials — never commit
+.env
+accounts.txt
+
+# runtime artifacts
+server.log
+*.log
+
+# python
+.venv/
+__pycache__/
+*.pyc
