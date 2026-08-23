@@ -139,13 +139,20 @@ _CITE_TOKEN_RE = re.compile(r"turn(\d+)([a-z]+)(\d+)")
 # rendered inline as just the name ("Microsoft Wireless Optical Mouse 2000");
 # stripping it blanks e.g. numbered product headings.
 _ENTITY_BLOCK_RE = re.compile("\\ue200entity\\ue202([^\\ue201]*?)\\ue201")
+# Inline link widgets carry a VISIBLE title and either a ref token or the raw URL:
+#   "\ue200url\ue202Oh My Pi SDK Docs\ue202turn0search0\ue201"      (ref token -> cite_map)
+#   "\ue200video\ue202Eternity scene\ue202turn0youtube12\ue201"    (ref token -> cite_map)
+#   "\ue200url\ue202Bitwarden\ue202https://bitwarden.com\ue201"    (raw URL inline)
+# Stripping them leaves dangling "- " bullets / "label: " lines with no link.
+_LINK_BLOCK_RE = re.compile("\\ue200(?:url|video)\\ue202([^\\ue201]*?)(?:\\ue202([^\\ue201]*?))?\\ue201")
 # The rest duplicate what the surrounding prose/links/table already say, so
 # they are stripped outright. The [a-z_]+ arm catches ANY other named widget
 # generically (payload after an optional \ue202 separator), so new kinds
-# degrade to stripped instead of leaking; well-formed cite/entity blocks are
-# excluded so all three regexes can be merged positionally.
+# degrade to stripped instead of leaking; well-formed cite/entity/link blocks
+# are excluded so all four regexes can be merged positionally.
 _WIDGET_BLOCK_RE = re.compile(
-    "\\ue200(?!cite\\ue202turn)(?!entity\\ue202)(?:navlist|[a-z_]+)(?:\\ue202[^\\ue201]*?)?\\ue201")
+    "\\ue200(?!cite\\ue202turn)(?!entity\\ue202)(?!url\\ue202)(?!video\\ue202)"
+    "(?:navlist|[a-z_]+)(?:\\ue202[^\\ue201]*?)?\\ue201")
 _PUA_CHARS_RE = re.compile("[\\ue200-\\ue205]")
 _GENUI_PREFIX = "\ue200genui"
 
@@ -237,7 +244,8 @@ def _render_citations(raw: str, cmap: dict[tuple[int, str, int], dict], *,
     pos = 0
     safe = 0
     hold = -1  # display index from which output may still change
-    matches = sorted((m for pat in (_CITE_BLOCK_RE, _ENTITY_BLOCK_RE, _WIDGET_BLOCK_RE)
+    matches = sorted((m for pat in (_CITE_BLOCK_RE, _ENTITY_BLOCK_RE, _LINK_BLOCK_RE,
+                                    _WIDGET_BLOCK_RE)
                       for m in pat.finditer(raw)), key=lambda m: m.start())
     for m in matches:
         gap = raw[pos:m.start()]
@@ -259,6 +267,28 @@ def _render_citations(raw: str, cmap: dict[tuple[int, str, int], dict], *,
             # markers (\ue200entity\ue201, entity-named widgets) only match
             # the group-less widget arm and have no group(1) to render.
             piece = _format_entity(m.group(1))
+        elif m.group(0).startswith(("\ue200url\ue202", "\ue200video\ue202")):
+            # predicate must mirror _LINK_BLOCK_RE exactly: title is always
+            # visible; target (group 2) is either a ref token resolved via
+            # cite_map or a raw URL. Unresolved ref tokens hold mid-stream and
+            # drop at final, like cite blocks.
+            title = " ".join((m.group(1) or "").split()).replace("[", "(").replace("]", ")")
+            target = (m.group(2) or "").strip()
+            src: dict | None = None
+            rt = _CITE_TOKEN_RE.fullmatch(target)
+            if rt:
+                src = cmap.get((int(rt.group(1)), rt.group(2), int(rt.group(3))))
+                if src is None and not final:
+                    if hold < 0:
+                        hold = safe  # sources may still arrive; hold the block
+                elif src is not None:
+                    piece = f"[{title}]({_clean_url(src['url'])})" if title else _format_source(src)
+            elif target.startswith(("http://", "https://")):
+                piece = f"[{title}]({_clean_url(target)})" if title else _clean_url(target)
+            elif title.startswith(("http://", "https://")):
+                piece = _clean_url(title)  # two-part form: the URL IS the payload
+            else:
+                piece = title  # no/unknown target: the title itself is the content
         elif charts_out is not None and m.group(0).startswith(_GENUI_PREFIX):
             payload = m.group(0)[len(_GENUI_PREFIX):-1].lstrip("\ue202")
             try:
