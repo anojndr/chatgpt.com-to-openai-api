@@ -7,7 +7,9 @@ proper multi-turn continuation.
 from __future__ import annotations
 
 
+import asyncio
 import io
+import json
 import logging
 import re
 import time
@@ -20,6 +22,7 @@ from PIL import Image
 
 from .adapters import HistoryItem, ParsedRequest, estimate_tokens, map_model
 from .accounts import AccountPool, NoAccountAvailable
+from .charts import ChartError, chart_from_payload, render_chart_png
 from .chatgpt import AccountSession, ChatGPTError
 from .pixelvault import PixelVaultError, upload_image
 from .store import ConvRef, ResponseRecord, TurnSnapshot, STORE, item_hash
@@ -125,6 +128,21 @@ def _classify_accumulated(text: str) -> tuple[int, bool]:
 # tracking parameters so clients see clean links.
 _CITE_BLOCK_RE = re.compile("\ue200cite(?:\ue202turn\\d+[a-z]+\\d+)+\ue201")
 _CITE_TOKEN_RE = re.compile(r"turn(\d+)([a-z]+)(\d+)")
+# Non-citation rich-content widgets ride the same \ue200..\ue201 delimiters:
+#   "\ue200navlist\ue202<title>\ue202turn0news1...\ue201"   -- UI nav chips
+#   "\ue200image_group\ue202{\"layout\":...}\ue201"          -- image carousel query
+#   "\ue200genui\ue202{\"chart\":...}\ue201"                 -- chart spec: rendered
+#       locally to a PNG and delivered as a PixelVault image link (see run_turn)
+#   "\ue200map\ue202{\"query\":...}\ue201"                   -- map card
+# The rest duplicate what the surrounding prose/links/table already say, so
+# they are stripped outright. The [a-z_]+ arm catches ANY other named widget
+# generically (payload after an optional \ue202 separator), so new kinds
+# degrade to stripped instead of leaking; well-formed cite blocks are excluded
+# so both regexes can be merged positionally.
+_WIDGET_BLOCK_RE = re.compile(
+    "\\ue200(?!cite\\ue202turn)(?:navlist|[a-z_]+)(?:\\ue202[^\\ue201]*?)?\\ue201")
+_PUA_CHARS_RE = re.compile("[\\ue200-\\ue205]")
+_GENUI_PREFIX = "\ue200genui"
 
 
 def _cite_map_extend(cmap: dict[tuple[int, str, int], dict], meta: Any) -> None:
@@ -184,33 +202,52 @@ def _format_source(src: dict) -> str:
 
 
 def _render_citations(raw: str, cmap: dict[tuple[int, str, int], dict], *,
-                      final: bool = False) -> tuple[str, int]:
+                      final: bool = False,
+                      charts_out: list[dict] | None = None) -> tuple[str, int]:
     """Rewrite citation-marker blocks in one cumulative text snapshot to links.
 
     Returns (rendered_text, safe_len). safe_len bounds the prefix that is
     provably stable: complete blocks with still-unresolved tokens hold the
     stream at their start (their bytes would change once sources arrive);
     a trailing half-received block holds likewise. With final=True the stream
-    is over -- unresolved tokens are dropped instead of held.
+    is over -- unresolved tokens are dropped instead of held. When charts_out
+    is a list (final pass), genui chart specs are collected into it for the
+    caller to render and upload.
     """
     out: list[str] = []
     pos = 0
     safe = 0
     hold = -1  # display index from which output may still change
-    for m in _CITE_BLOCK_RE.finditer(raw):
+    matches = sorted((m for pat in (_CITE_BLOCK_RE, _WIDGET_BLOCK_RE)
+                      for m in pat.finditer(raw)), key=lambda m: m.start())
+    for m in matches:
         gap = raw[pos:m.start()]
         out.append(gap)
         if hold < 0:
             safe += len(gap)
         pos = m.end()
-        tokens = _CITE_TOKEN_RE.findall(m.group(0))
-        sources = [cmap.get((int(t), rt, int(n))) for t, rt, n in tokens]
-        resolved = [s for s in sources if s]
         piece = ""
-        if len(resolved) == len(tokens) or final:
-            piece = " ".join(_format_source(s) for s in resolved)
-        elif hold < 0:
-            hold = safe  # withhold this block (and everything after it)
+        if m.group(0).startswith("\ue200cite"):
+            tokens = _CITE_TOKEN_RE.findall(m.group(0))
+            sources = [cmap.get((int(t), rt, int(n))) for t, rt, n in tokens]
+            resolved = [s for s in sources if s]
+            if len(resolved) == len(tokens) or final:
+                piece = " ".join(_format_source(s) for s in resolved)
+            elif hold < 0:
+                hold = safe  # withhold this block (and everything after it)
+        elif charts_out is not None and m.group(0).startswith(_GENUI_PREFIX):
+            payload = m.group(0)[len(_GENUI_PREFIX):-1].lstrip("\ue202")
+            try:
+                # model-supplied JSON can be anything (non-object scalars,
+                # Infinity/NaN literals) -- a bad widget must never raise into
+                # the post-flush failure path once content already streamed
+                spec = chart_from_payload(json.loads(payload))
+            except Exception:
+                spec = None
+            if spec:
+                charts_out.append(spec)
+            # widget itself is still stripped from the text; the caller appends
+            # a rendered image link after the flush
         out.append(piece)
         if hold < 0:
             safe += len(piece)
@@ -231,6 +268,9 @@ def _render_citations(raw: str, cmap: dict[tuple[int, str, int], dict], *,
                 safe += len(tail)
     text = "".join(out)
     if final:
+        # end of stream: drop leftover invisible marker scaffolding (stray
+        # delimiters/separators); visible content is never made of these
+        text = _PUA_CHARS_RE.sub("", text)
         return text, len(text)
     return text, min(safe, len(text))
 
@@ -449,6 +489,7 @@ async def run_turn(
             text_acc = ""
             emitted = 0
             cite_map: dict[tuple[int, str, int], dict] = {}
+            chart_specs: list[dict] = []
             current_msg_id = ""
             sediment: list[str] = []
             cid = ""
@@ -534,11 +575,33 @@ async def run_turn(
             # Flush anything still withheld first: short normal replies that
             # begin like the refusal must reach the client in full. final=True
             # also releases citation blocks whose sources never arrived.
-            display, _ = _render_citations(text_acc, cite_map, final=True)
+            display, _ = _render_citations(text_acc, cite_map, final=True,
+                                           charts_out=chart_specs)
             if emitted < len(display):
                 produced = True
                 yield {"type": "delta", "text": display[emitted:]}
             text_acc = display
+
+            # genui chart specs -> locally rendered PNG -> PixelVault link.
+            # Any failure degrades to the widget simply being stripped.
+            chart_links: list[str] = []
+            for spec in chart_specs:
+                title = " ".join(str((spec.get("meta") or {}).get("title") or "chart").split())
+                alt = f"chart: {title}".replace("[", "(").replace("]", ")")
+                try:
+                    # PIL draw time scales with row count -- keep it off the
+                    # event loop so concurrent requests never stall behind a
+                    # pathological widget payload
+                    png = await asyncio.to_thread(render_chart_png, spec)
+                    url = await upload_image("chart.png", png, "image/png")
+                    chart_links.append(f"![{alt}]({url})")
+                except Exception as e:
+                    log.warning("chart render/upload failed (%s): %s", title[:60], e)
+            if chart_links:
+                links = "\n\n" + "\n\n".join(chart_links)
+                produced = True
+                yield {"type": "delta", "text": links}
+                text_acc += links
 
             image_urls = await _resolve_images(acct, sediment)
             if image_urls:
