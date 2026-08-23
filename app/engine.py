@@ -134,13 +134,18 @@ _CITE_TOKEN_RE = re.compile(r"turn(\d+)([a-z]+)(\d+)")
 #   "\ue200genui\ue202{\"chart\":...}\ue201"                 -- chart spec: rendered
 #       locally to a PNG and delivered as a PixelVault image link (see run_turn)
 #   "\ue200map\ue202{\"query\":...}\ue201"                   -- map card
+# Entity/product cards carry visible content -- the display name IS the answer:
+#   "\ue200entity\ue202["product","Microsoft Wireless Optical Mouse 2000","Model 1067"]\ue201"
+# rendered inline as just the name ("Microsoft Wireless Optical Mouse 2000");
+# stripping it blanks e.g. numbered product headings.
+_ENTITY_BLOCK_RE = re.compile("\\ue200entity\\ue202([^\\ue201]*?)\\ue201")
 # The rest duplicate what the surrounding prose/links/table already say, so
 # they are stripped outright. The [a-z_]+ arm catches ANY other named widget
 # generically (payload after an optional \ue202 separator), so new kinds
-# degrade to stripped instead of leaking; well-formed cite blocks are excluded
-# so both regexes can be merged positionally.
+# degrade to stripped instead of leaking; well-formed cite/entity blocks are
+# excluded so all three regexes can be merged positionally.
 _WIDGET_BLOCK_RE = re.compile(
-    "\\ue200(?!cite\\ue202turn)(?:navlist|[a-z_]+)(?:\\ue202[^\\ue201]*?)?\\ue201")
+    "\\ue200(?!cite\\ue202turn)(?!entity\\ue202)(?:navlist|[a-z_]+)(?:\\ue202[^\\ue201]*?)?\\ue201")
 _PUA_CHARS_RE = re.compile("[\\ue200-\\ue205]")
 _GENUI_PREFIX = "\ue200genui"
 
@@ -201,6 +206,20 @@ def _format_source(src: dict) -> str:
     return f"[{label.replace('[', '(').replace(']', ')')}]({url})"
 
 
+def _format_entity(payload: str) -> str:
+    """Display name of an entity widget payload; "" when it cannot be parsed."""
+    try:
+        parsed = json.loads(payload.split("\ue202")[0])
+    except Exception:
+        return ""
+    if isinstance(parsed, list):
+        parsed = parsed[1] if len(parsed) >= 2 and isinstance(parsed[1], str) else None
+    if not isinstance(parsed, str):
+        return ""
+    # same markdown-safety swaps as citation labels
+    return " ".join(parsed.split()).replace("[", "(").replace("]", ")")
+
+
 def _render_citations(raw: str, cmap: dict[tuple[int, str, int], dict], *,
                       final: bool = False,
                       charts_out: list[dict] | None = None) -> tuple[str, int]:
@@ -218,7 +237,7 @@ def _render_citations(raw: str, cmap: dict[tuple[int, str, int], dict], *,
     pos = 0
     safe = 0
     hold = -1  # display index from which output may still change
-    matches = sorted((m for pat in (_CITE_BLOCK_RE, _WIDGET_BLOCK_RE)
+    matches = sorted((m for pat in (_CITE_BLOCK_RE, _ENTITY_BLOCK_RE, _WIDGET_BLOCK_RE)
                       for m in pat.finditer(raw)), key=lambda m: m.start())
     for m in matches:
         gap = raw[pos:m.start()]
@@ -235,6 +254,11 @@ def _render_citations(raw: str, cmap: dict[tuple[int, str, int], dict], *,
                 piece = " ".join(_format_source(s) for s in resolved)
             elif hold < 0:
                 hold = safe  # withhold this block (and everything after it)
+        elif m.group(0).startswith("\ue200entity\ue202"):
+            # predicate must mirror _ENTITY_BLOCK_RE exactly: degenerate
+            # markers (\ue200entity\ue201, entity-named widgets) only match
+            # the group-less widget arm and have no group(1) to render.
+            piece = _format_entity(m.group(1))
         elif charts_out is not None and m.group(0).startswith(_GENUI_PREFIX):
             payload = m.group(0)[len(_GENUI_PREFIX):-1].lstrip("\ue202")
             try:
