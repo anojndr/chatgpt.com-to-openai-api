@@ -488,6 +488,11 @@ async def run_turn(
 
             text_acc = ""
             emitted = 0
+            # Set once the success-path final flush has released everything
+            # renderable; from then on the failure-path salvage pass must be a
+            # no-op (it would only re-send bytes the client already has,
+            # because success-path yields advance text_acc but not emitted).
+            fully_flushed = False
             cite_map: dict[tuple[int, str, int], dict] = {}
             chart_specs: list[dict] = []
             current_msg_id = ""
@@ -586,6 +591,7 @@ async def run_turn(
                 produced = True
                 yield {"type": "delta", "text": display[emitted:]}
             text_acc = display
+            fully_flushed = True
 
             # genui chart specs -> locally rendered PNG -> PixelVault link.
             # Any failure degrades to the widget simply being stripped.
@@ -673,7 +679,7 @@ async def run_turn(
                 # collected here (widgets strip): the failure path must never
                 # start new render/upload work.
                 _, still_limit = _classify_accumulated(text_acc)
-                if not still_limit:
+                if not still_limit and not fully_flushed:
                     try:
                         salvaged, _ = _render_citations(text_acc, cite_map, final=True)
                         if emitted < len(salvaged):
