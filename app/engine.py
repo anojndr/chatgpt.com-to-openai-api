@@ -525,12 +525,17 @@ async def run_turn(
                     text_acc = ""
                 content = m.get("content") or {}
                 parts = content.get("parts") or []
+                # Only 'text' nodes carry client-visible prose. thoughts/code/
+                # reasoning_recap/model_editable_context nodes share the
+                # assistant role; their string parts (when present) are
+                # internal channel data and must never stream as the answer.
+                is_text_node = (content.get("content_type") or "text") == "text"
                 for p in parts:
                     if isinstance(p, dict):
                         ptr = p.get("asset_pointer")
                         if isinstance(ptr, str) and "sediment://" in ptr and ptr not in sediment:
                             sediment.append(ptr)
-                    elif isinstance(p, str) and author.get("role") == "assistant":
+                    elif isinstance(p, str) and author.get("role") == "assistant" and is_text_node:
                         text_acc = p
                         # Withhold bytes while they could still be the image-limit
                         # refusal: once visible, accounts can no longer be switched.
@@ -659,6 +664,23 @@ async def run_turn(
             if produced:
                 # Content already streamed to the client: rotating would
                 # duplicate or contradict visible output.
+                # Salvage pass: release whatever upstream already delivered
+                # but was still withheld (unresolved cite blocks hold the
+                # emitter, half-received markers trail). An aborted turn then
+                # degrades to a shorter answer instead of one that stops
+                # mid-sentence right where the first held block sat.
+                # Refusal-shaped text stays withheld, and chart specs are not
+                # collected here (widgets strip): the failure path must never
+                # start new render/upload work.
+                _, still_limit = _classify_accumulated(text_acc)
+                if not still_limit:
+                    try:
+                        salvaged, _ = _render_citations(text_acc, cite_map, final=True)
+                        if emitted < len(salvaged):
+                            yield {"type": "delta", "text": salvaged[emitted:]}
+                            text_acc = salvaged
+                    except Exception as salvage_error:
+                        log.warning("salvage flush failed: %s", salvage_error)
                 raise failure from e
             last_failure = failure
             remaining = sum(1 for a in pool.available() if a.identity not in tried)
