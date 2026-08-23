@@ -134,7 +134,11 @@ class AccountPool:
             acct.cooldown_until = now + cd
             log.warning("[%s] rate limited, cooling down %ss", acct.email, cd)
         elif status == 401:
-            acct.cooldown_until = now + 5
+            # A 401 from a confirmed-stale session (dead=True set by
+            # refresh_access_token) must stay out of rotation entirely;
+            # transient 401s just get a short cooldown.
+            if not acct.dead:
+                acct.cooldown_until = now + 5
         elif status == 403:
             acct.cooldown_until = now + 10
 

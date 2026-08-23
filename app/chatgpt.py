@@ -158,6 +158,9 @@ class AccountSession:
                             "account needs re-login for bearer-authenticated calls",
                             self.email, "unparseable" if not new_exp else "expired",
                             max(0.0, (new_exp or 0.0) - time.time()))
+                # Confirmed stale: the session cookie itself can no longer
+                # produce a usable token, so keep this account out of rotation
+                self.dead = True
                 return False
             self.access_token = new_at
             self._jwt_exp = _jwt_exp(new_at)
@@ -249,6 +252,25 @@ class AccountSession:
         """
         await self.ensure_token()
         await self._ensure_build_info()  # warm build id/scripts for proof config
+        # Image generation and editing are gated on a logged-in session server-side.
+        # Sending the request cookie-only (expired JWT) silently degrades ChatGPT to
+        # an anonymous conversation that answers image asks with "requires login"
+        # refusals. Fail fast with 401 so the pool rotates to an account that can
+        # actually serve images.
+        if self.dead:
+            raise ChatGPTError(
+                401,
+                f"[{self.email}] session is stale (dead); re-login this account "
+                f"to generate images",
+            )
+        if not (self.access_token and time.time() < self._jwt_exp - 60):
+            if not await self.refresh_access_token():
+                raise ChatGPTError(
+                    401,
+                    f"[{self.email}] no valid access token "
+                    f"({'session removed' if self._closed else 'stale session cookie'}); "
+                    f"re-login this account to generate images",
+                )
         image_pointers = [p for p in (image_pointers or []) if isinstance(p, dict)]
         parts: list[Any] = ([prompt_text] if prompt_text else []) + image_pointers
         has_media = bool(image_pointers)

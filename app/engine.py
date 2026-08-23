@@ -71,13 +71,52 @@ class _ImageLimitError(Exception):
 # flourish may precede it), so a reply that merely QUOTES the template
 # mid-text -- even after a short prose lead-in -- is never mistaken for one.
 IMAGE_LIMIT_RE = re.compile(
-    r"\A[\s>*#\-`]{0,16}you(?:'ve| have)\s+hit\s+(?:the|your)\s+"
-    r".*?plan\s+limit\s+for\s+image\s+generations?\s+requests",
+    r"\A[\s>*#\-`]{0,16}(?:"
+    r"you(?:'ve| have)\s+hit\s+(?:the|your)\s+.*?plan\s+limit\s+for\s+image\s+generations?\s+requests"
+    r"|"
+    r"(?:image\s+(?:generation|editing)(?:\s+and\s+(?:image\s+)?(?:generation|editing))?|image\s+creation)\s+require(?:s)?\s+(?:you\s+to\s+be\s+|being\s+|to\s+be\s+)?log(?:ged|ging)\s+in"
+    r"|"
+    r"(?:i\s+can\s+(?:help\s+)?(?:create|generate)\s+that\s+image,\s+but\s+)?"
+    r"image\s+generation\s+isn['’]t\s+available\s+in\s+this\s+chat(?:\s+right\s+now)?"
+    r"|"
+    r"log\s+in\s+to\s+(?:generate|create|edit)\s+images?"
+    r")",
     re.IGNORECASE | re.DOTALL,
 )
-_LIMIT_STARTERS = ("you've hit the ", "you have hit the ", "you've hit your ")
+_LIMIT_STARTERS = ("you've hit the ", "you have hit the ", "you've hit your ", "you have hit your ",
+    "image generation and image editing require",
+    "image generation and editing require",
+    "image generation require",
+    "image generation isn't available",
+    "image generation isn’t available",
+    "image editing and image generation require",
+    "image editing and generation require",
+    "image editing require",
+    "image creation require",
+    "i can help create that image, but ",
+    "i can help generate that image, but ",
+    "i can create that image, but ",
+    "i can generate that image, but ",
+    "log in to generate ",
+    "log in to create ",
+    "log in to edit ",)
 _PLAN_WORDS = ("free", "plus", "pro", "team", "enterprise")
-_LIMIT_MAX_LEN = 220  # refusal sentences stay well under this; longer text can't be one
+# After a full non-quota starter match ("image generation requires..."), only these
+# next words can still grow into a refusal; anything else ("requires a lot of...")
+# is provably a normal reply and releases immediately.
+def _refusal_next_words(starter):
+    """Next words after a full starter match that can still grow into a refusal;
+    any other word proves a normal reply and releases the stream immediately."""
+    if starter.startswith("log in to "):
+        return ("images",)          # "log in to generate/create/edit images"
+    if starter.startswith("i can "):
+        return ("image",)           # "...but image generation isn't available"
+    if "require" in starter:
+        return ("log", "you", "being", "to")  # logging/logged in, you to be, being, to be
+    return None  # no gate known: hold until the regex or max-len releases
+_LIMIT_MAX_LEN = 260  # refusal sentences stay well under this; longer text can't be one
+# Login/availability refusals ("...isn't available in this chat right now.
+# Once you're logged in...") run longer than quota refusals, hence the cap.
 
 
 def _classify_accumulated(text: str) -> tuple[int, bool]:
@@ -93,24 +132,46 @@ def _classify_accumulated(text: str) -> tuple[int, bool]:
     if len(text) > _LIMIT_MAX_LEN:
         return len(text), False
     low = text.lower()
+    stripped = low.lstrip(" \t\n\r>*#-`")
+    # Still compatible with some refusal opening? Hold until it diverges.
     for starter in _LIMIT_STARTERS:
-        if low.startswith(starter):
-            # Fixed head matched; only a plan-name-looking next word can
-            # still grow into the refusal ("Free"/"Plus"/...).
-            rest = low[len(starter):]
-            m = re.match(r"[a-z]+", rest)
-            word = m.group(0) if m else ""
+        if not stripped.startswith(starter[:1]):
+            continue  # cheap first-char gate before per-char comparison
+        n = min(len(stripped), len(starter))
+        i = 0
+        while i < n and stripped[i] == starter[i]:
+            i += 1
+        if i < n:
+            continue  # diverged from this starter; try the next one
+        if len(stripped) < len(starter):
+            return 0, False  # text is still a strict prefix of this starter: hold
+        if len(stripped) == len(starter):
+            return 0, False  # text ends exactly at the starter boundary: hold
+        # Full starter matched with more text following. For quota starters,
+        # only a plan-name-looking next word can still grow into the refusal
+        # ("Free"/"Plus"/...); any other continuation ("You've hit the nail...")
+        # is a normal reply. Refusal starters always stay held until the regex
+        # confirms (or _LIMIT_MAX_LEN releases).
+        rest = stripped[len(starter):]
+        m = re.match(r"[a-z]+", rest)
+        word = m.group(0) if m else ""
+        if starter.startswith(("you've hit", "you have hit")):
             if not word or any(w.startswith(word) or word.startswith(w) for w in _PLAN_WORDS):
                 return 0, False
             return len(text), False  # "You've hit the nail..." -> normal reply
-    # Still compatible with some refusal opening? Hold until it diverges.
-    for starter in _LIMIT_STARTERS:
-        n = min(len(low), len(starter))
-        i = 0
-        while i < n and low[i] == starter[i]:
-            i += 1
-        if i == n:  # consumed the whole text within this opening
-            return 0, False
+        allowed = _refusal_next_words(starter)
+        if allowed is None:
+            return 0, False  # no gate for this starter: hold until regex/max-len
+        # Starters ending at "require": a streamed plural "s"/space is not the
+        # next word — skip it before the continuation check.
+        after = rest[1:] if word == "s" else rest
+        m2 = re.match(r"[a-z]+", after.lstrip(" "))
+        nxt_word = m2.group(0) if m2 else ""
+        if not nxt_word:
+            return 0, False  # bare "requires"/whitespace so far: ambiguous, hold
+        if any(n.startswith(nxt_word) or nxt_word.startswith(n) for n in allowed):
+            return 0, False  # could still grow into a refusal ("logging in"...)
+        return len(text), False  # provably diverged -> normal reply
     return len(text), False  # diverged from every opening -> cannot be the refusal
 
 
