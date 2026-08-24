@@ -19,6 +19,7 @@ PORT=4035
 # DEFAULT_MODEL=auto
 # COOLDOWN_FREE_SECONDS=900
 # COOLDOWN_PLUS_SECONDS=120
+# CHATGPT_INCLUDE_SOURCES=0        # append Sources block for llmcord-go Show Sources button
 ```
 
 ## Accounts
@@ -93,6 +94,21 @@ Generated images are detected in the stream (`sediment://` pointers), downloaded
 ```
 
 Try: `{"model":"auto","messages":[{"role":"user","content":"generate an image of a cat"}]}`
+### Show Sources (llmcord-go)
+
+To feed search citations into `llmcord-go`'s **Show Sources** button:
+- Enable globally by setting `CHATGPT_INCLUDE_SOURCES=1` (or `INCLUDE_SOURCES=1`) in `.env`.
+- Or enable per request with `"include_sources": true` in the JSON request body (e.g. in `llmcord-go`, set `extra_body: {include_sources: true}`).
+
+When enabled and ChatGPT uses web search, an appendix formatted as:
+```markdown
+Sources
+1. [Title](url) (domain) via `query`
+
+Search Queries
+1. `query`
+```
+is appended at the end of the turn. `llmcord-go` automatically hides this appendix from the visible message while rendering and parses it to populate the **Show Sources** button and paginated sources view.
 
 ## Not supported
 

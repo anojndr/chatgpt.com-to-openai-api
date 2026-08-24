@@ -21,6 +21,7 @@ from typing import Any, AsyncIterator
 from PIL import Image
 
 from .adapters import HistoryItem, ParsedRequest, estimate_tokens, map_model
+from . import config
 from .accounts import AccountPool, NoAccountAvailable
 from .charts import ChartError, chart_from_payload, render_chart_png
 from .chatgpt import AccountSession, ChatGPTError
@@ -272,6 +273,67 @@ def _format_source(src: dict) -> str:
     # brackets would break markdown link text in renderers without \-escape
     # support (e.g. Discord); swap them out instead of escaping
     return f"[{label.replace('[', '(').replace(']', ')')}]({url})"
+
+SOURCE_APPENDIX_MAX = 50
+
+
+def _host_of(url: str) -> str:
+    try:
+        return (urllib.parse.urlsplit(url).netloc or "").lower()
+    except Exception:
+        return ""
+
+
+def _source_appendix(sources: list[dict], query: str = "") -> str:
+    """Bridge source appendix for llmcord-go's "Show Sources" button.
+
+    Matches the appendix contract parsed by llmcord-go across bridge providers:
+        \n\nSources
+        1. [Title](url) (domain) via `query`
+
+        Search Queries
+        1. `query`
+    """
+    entries: list[str] = []
+    seen_urls: set[str] = set()
+    clean_query = query.replace("`", "'").strip() if query else ""
+    for src in sources[:SOURCE_APPENDIX_MAX]:
+        if not isinstance(src, dict):
+            continue
+        raw_url = src.get("url")
+        if not isinstance(raw_url, str) or not raw_url.strip():
+            continue
+        url = _clean_url(raw_url).replace("\n", "").replace("\r", "")
+        if not url or url.lower() in seen_urls:
+            continue
+        seen_urls.add(url.lower())
+
+        title = " ".join((src.get("title") or "").split()).replace("[", "(").replace("]", ")")
+        if not title:
+            title = " ".join((src.get("attr") or "").split()).replace("[", "(").replace("]", ")")
+        if not title:
+            host = _host_of(url)
+            title = host[4:] if host.startswith("www.") else host
+        if not title:
+            title = url
+
+        entry = f"[{title}]({url})"
+        host = _host_of(url)
+        if title != url and host:
+            entry += f" ({host})"
+        if clean_query:
+            entry += f" via `{clean_query}`"
+        entries.append(entry)
+
+    if not entries:
+        return ""
+    lines = ["Sources"]
+    lines.extend(f"{i}. {entry}" for i, entry in enumerate(entries, start=1))
+    if clean_query:
+        lines.append("")
+        lines.append("Search Queries")
+        lines.append(f"1. `{clean_query}`")
+    return "\n\n" + "\n".join(lines)
 
 
 def _format_entity(payload: str) -> str:
@@ -735,6 +797,19 @@ async def run_turn(
                 produced = True
                 yield {"type": "delta", "text": links}
                 text_acc += links
+            inc_sources = config.INCLUDE_SOURCES if parsed.include_sources is None else parsed.include_sources
+            if inc_sources and cite_map:
+                # Extract latest user message text as query fallback if available
+                user_query = ""
+                for item in reversed(parsed.items):
+                    if item.role == "user" and item.text:
+                        user_query = item.text
+                        break
+                appendix = _source_appendix(list(cite_map.values()), query=user_query)
+                if appendix:
+                    produced = True
+                    yield {"type": "delta", "text": appendix}
+                    text_acc += appendix
 
             created = int(time.time())
 

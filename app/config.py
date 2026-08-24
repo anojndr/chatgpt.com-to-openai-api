@@ -26,6 +26,7 @@ HOST: str = os.environ.get("HOST", "0.0.0.0")
 
 ACCOUNTS_FILE: Path = ROOT / os.environ.get("ACCOUNTS_FILE", "accounts.txt")
 API_KEY: str = os.environ.get("API_KEY", "")  # optional bearer gate for THIS proxy
+INCLUDE_SOURCES: bool = os.environ.get("CHATGPT_INCLUDE_SOURCES", os.environ.get("INCLUDE_SOURCES", "0")).strip().lower() in ("1", "true", "yes", "on")
 
 DEFAULT_MODEL: str = os.environ.get("DEFAULT_MODEL", "auto")
 COOLDOWN_FREE_SECONDS: int = int(os.environ.get("COOLDOWN_FREE_SECONDS", "900"))

@@ -108,6 +108,7 @@ class ParsedRequest:
     items: list[HistoryItem]
     model_requested: str | None
     stream: bool
+    include_sources: bool | None = None
 
 
 # ---------------------------------------------------------------- content helpers
@@ -310,6 +311,7 @@ async def parse_chat_request(body: dict) -> ParsedRequest:
         items=items,
         model_requested=body.get("model"),
         stream=bool(body.get("stream")),
+        include_sources=body.get("include_sources") if isinstance(body.get("include_sources"), bool) else None,
     )
 
 
@@ -395,6 +397,7 @@ async def parse_responses_request(body: dict) -> tuple[ParsedRequest, str | None
         items=items,
         model_requested=body.get("model"),
         stream=bool(body.get("stream")),
+        include_sources=body.get("include_sources") if isinstance(body.get("include_sources"), bool) else None,
     )
     return parsed, prev_id, body.get("store", True)
 
