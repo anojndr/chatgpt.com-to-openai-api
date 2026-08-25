@@ -15,6 +15,7 @@ PIXELVAULT_API_KEY=pv_live_xxx     # required for generated-image hosting
 PORT=4035
 # optional:
 # ACCOUNTS_FILE=accounts.txt
+# DB_PATH=data/conversations.db    # SQLite persistence for conversations & snapshots
 # API_KEY=...                      # require this bearer key on /v1/*
 # DEFAULT_MODEL=auto
 # COOLDOWN_FREE_SECONDS=900

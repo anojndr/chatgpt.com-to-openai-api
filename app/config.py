@@ -25,6 +25,7 @@ PORT: int = int(os.environ.get("PORT", "4035"))
 HOST: str = os.environ.get("HOST", "0.0.0.0")
 
 ACCOUNTS_FILE: Path = ROOT / os.environ.get("ACCOUNTS_FILE", "accounts.txt")
+DB_PATH: Path = ROOT / os.environ.get("DB_PATH", "data/conversations.db")
 API_KEY: str = os.environ.get("API_KEY", "")  # optional bearer gate for THIS proxy
 INCLUDE_SOURCES: bool = os.environ.get("CHATGPT_INCLUDE_SOURCES", os.environ.get("INCLUDE_SOURCES", "0")).strip().lower() in ("1", "true", "yes", "on")
 

@@ -5,6 +5,12 @@ accounts.txt
 # runtime artifacts
 server.log
 *.log
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
 
 # python
 .venv/
