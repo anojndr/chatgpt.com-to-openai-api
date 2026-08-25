@@ -196,10 +196,9 @@ _CITE_TOKEN_RE = re.compile(r"turn(\d+)([a-z]+)(\d+)")
 #   "\ue200genui\ue202{\"chart\":...}\ue201"                 -- chart spec: rendered
 #       locally to a PNG and delivered as a PixelVault image link (see run_turn)
 #   "\ue200map\ue202{\"query\":...}\ue201"                   -- map card
-# Entity/product cards carry visible content -- the display name IS the answer:
+# Entity/product cards carry visible content and must not be stripped.
 #   "\ue200entity\ue202["product","Microsoft Wireless Optical Mouse 2000","Model 1067"]\ue201"
-# rendered inline as just the name ("Microsoft Wireless Optical Mouse 2000");
-# stripping it blanks e.g. numbered product headings.
+# Product references render as titled markdown links when possible.
 _ENTITY_BLOCK_RE = re.compile("\\ue200entity\\ue202([^\\ue201]*?)\\ue201")
 # Inline link widgets carry a VISIBLE title and either a ref token or the raw URL:
 #   "\ue200url\ue202Oh My Pi SDK Docs\ue202turn0search0\ue201"      (ref token -> cite_map)
@@ -207,13 +206,14 @@ _ENTITY_BLOCK_RE = re.compile("\\ue200entity\\ue202([^\\ue201]*?)\\ue201")
 #   "\ue200url\ue202Bitwarden\ue202https://bitwarden.com\ue201"    (raw URL inline)
 # Stripping them leaves dangling "- " bullets / "label: " lines with no link.
 _LINK_BLOCK_RE = re.compile("\\ue200(?:url|video)\\ue202([^\\ue201]*?)(?:\\ue202([^\\ue201]*?))?\\ue201")
+_PRODUCTS_BLOCK_RE = re.compile("\\ue200products\\ue202([^\\ue201]*?)\\ue201")
 # The rest duplicate what the surrounding prose/links/table already say, so
 # they are stripped outright. The [a-z_]+ arm catches ANY other named widget
 # generically (payload after an optional \ue202 separator), so new kinds
-# degrade to stripped instead of leaking; well-formed cite/entity/link blocks
-# are excluded so all four regexes can be merged positionally.
+# degrade to stripped instead of leaking; well-formed cite/entity/link/product
+# blocks are excluded so all five regexes can be merged positionally.
 _WIDGET_BLOCK_RE = re.compile(
-    "\\ue200(?!cite\\ue202turn)(?!entity\\ue202)(?!url\\ue202)(?!video\\ue202)"
+    "\\ue200(?!cite\\ue202turn)(?!entity\\ue202)(?!url\\ue202)(?!video\\ue202)(?!products\\ue202)"
     "(?:navlist|[a-z_]+)(?:\\ue202[^\\ue201]*?)?\\ue201")
 _PUA_CHARS_RE = re.compile("[\\ue200-\\ue205]")
 _GENUI_PREFIX = "\ue200genui"
@@ -223,27 +223,172 @@ def _cite_map_extend(cmap: dict[tuple[int, str, int], dict], meta: Any) -> None:
     """Merge one SSE event's citation sources into the per-turn map."""
     if not isinstance(meta, dict):
         return
-    for group in meta.get("search_result_groups") or []:
-        for entry in group.get("entries") or []:
+    content_refs = meta.get("content_references") or []
+    if not isinstance(content_refs, list):
+        content_refs = []
+    groups = meta.get("search_result_groups") or []
+    if not isinstance(groups, list):
+        groups = []
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        entries = group.get("entries") or []
+        if not isinstance(entries, list):
+            entries = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
             ref = entry.get("ref_id") or {}
             url = entry.get("url")
-            key = (ref.get("turn_index"), ref.get("ref_type"), ref.get("ref_index"))
-            if url and all(v is not None for v in key):
+            key = _cite_key(ref)
+            if url and key is not None:
                 cmap.setdefault(key, {"url": url, "title": entry.get("title"),
                                       "attr": entry.get("attribution")})
-    for cr in meta.get("content_references") or []:
-        if cr.get("type") != "grouped_webpages":
+    for cr in content_refs:
+        if not isinstance(cr, dict) or cr.get("type") != "grouped_webpages":
             continue
-        for item in cr.get("items") or []:
+        items = cr.get("items") or []
+        if not isinstance(items, list):
+            items = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
             sources = [{"url": item.get("url"), "title": item.get("title"),
                         "attr": item.get("attribution")}]
+            supporting = item.get("supporting_websites") or []
+            if not isinstance(supporting, list):
+                supporting = []
             sources += [{"url": s.get("url"), "title": s.get("title"),
                          "attr": s.get("attribution")}
-                        for s in item.get("supporting_websites") or []]
-            for ref, src in zip(item.get("refs") or [], sources):
-                key = (ref.get("turn_index"), ref.get("ref_type"), ref.get("ref_index"))
-                if src.get("url") and all(v is not None for v in key):
+                        for s in supporting if isinstance(s, dict)]
+            refs = item.get("refs") or []
+            if not isinstance(refs, list):
+                refs = []
+            for ref, src in zip(refs, sources):
+                key = _cite_key(ref)
+                if src.get("url") and key is not None:
                     cmap.setdefault(key, src)
+
+    for cr in content_refs:
+        if not isinstance(cr, dict):
+            continue
+        ctype = cr.get("type")
+        if ctype == "products":
+            refs = cr.get("refs") or []
+            products = cr.get("products") or []
+            if not isinstance(refs, list):
+                refs = []
+            if not isinstance(products, list):
+                products = []
+            for index, product in enumerate(products):
+                source = _product_source(product)
+                if source is None:
+                    continue
+                keys = []
+                cite = product.get("cite") if isinstance(product, dict) else None
+                if cite is not None:
+                    keys.append(_cite_key(cite))
+                if index < len(refs):
+                    keys.append(_cite_key(refs[index]))
+                for key in keys:
+                    if key is not None:
+                        cmap.setdefault(key, source)
+        elif ctype == "product_entity":
+            source = _product_source(cr.get("product"))
+            if source is None:
+                continue
+            product = cr.get("product") or {}
+            cite = product.get("cite") if isinstance(product, dict) else None
+            refs = cr.get("refs") or []
+            if not isinstance(refs, list):
+                refs = []
+            keys = [_cite_key(cite)] if cite is not None else []
+            keys.extend(_cite_key(ref) for ref in refs)
+            for key in keys:
+                if key is not None:
+                    cmap.setdefault(key, source)
+
+
+def _product_search_url(title: str) -> str:
+    """Return an actionable shopping search when ChatGPT has no product URL."""
+    query = " ".join(str(title or "").split()).strip()
+    if not query:
+        return ""
+    return "https://www.google.com/search?tbm=shop&q=" + urllib.parse.quote_plus(query)
+
+
+def _cite_key(token: Any) -> tuple[int, str, int] | None:
+    if isinstance(token, dict):
+        key = (token.get("turn_index"), token.get("ref_type"), token.get("ref_index"))
+        return key if (isinstance(key[0], int) and isinstance(key[1], str)
+                       and isinstance(key[2], int)) else None
+    match = _CITE_TOKEN_RE.fullmatch(str(token or "").strip())
+    if not match:
+        return None
+    return int(match.group(1)), match.group(2), int(match.group(3))
+
+
+def _product_source(product: Any) -> dict | None:
+    """Normalize a ChatGPT product reference into a citation source."""
+    if not isinstance(product, dict):
+        return None
+    title = " ".join(str(product.get("title") or "").split())
+    if not title:
+        return None
+    raw_url = product.get("url")
+    url = _clean_url(raw_url) if isinstance(raw_url, str) else ""
+    if not url:
+        url = _product_search_url(title)
+    return {"url": url, "title": title,
+            "attr": " ".join(str(product.get("merchants") or "").split()),
+            "kind": "product"}
+
+
+def _product_link(label: str, cmap: dict[tuple[int, str, int], dict],
+                  token: Any = None) -> str:
+    """Render one product as a link, with a search fallback for empty URLs."""
+    source = cmap.get(_cite_key(token)) if token is not None else None
+    title = " ".join(str((source or {}).get("title") or label).split())
+    title = title.replace("[", "(").replace("]", ")")
+    url = _clean_url((source or {}).get("url") or "") or _product_search_url(title)
+    return f"[{title}]({_clean_url(url)})" if url else title
+
+
+def _format_products(payload: str, cmap: dict[tuple[int, str, int], dict]) -> str:
+    """Render a products carousel as compact markdown links."""
+    try:
+        parsed = json.loads(payload)
+    except Exception:
+        return ""
+    selections = parsed.get("selections") if isinstance(parsed, dict) else parsed
+    if not isinstance(selections, list):
+        return ""
+    links: list[str] = []
+    for selection in selections:
+        if not isinstance(selection, list) or len(selection) < 2:
+            continue
+        token, label = selection[0], selection[1]
+        if not isinstance(label, str) or not label.strip():
+            continue
+        links.append(_product_link(label, cmap, token))
+    return " · ".join(links)
+
+
+def _products_unresolved(payload: str, cmap: dict[tuple[int, str, int], dict]) -> bool:
+    try:
+        parsed = json.loads(payload)
+    except Exception:
+        return False
+    selections = parsed.get("selections") if isinstance(parsed, dict) else parsed
+    if not isinstance(selections, list):
+        return False
+    return any(
+        isinstance(selection, list)
+        and len(selection) >= 2
+        and (key := _cite_key(selection[0])) is not None
+        and key not in cmap
+        for selection in selections
+    )
 
 
 def _clean_url(url: str) -> str:
@@ -251,7 +396,14 @@ def _clean_url(url: str) -> str:
     # Split the raw query instead of round-tripping through parse_qsl:
     # re-encoding survivors corrupts values (semicolon pairs collapse,
     # invalid-UTF-8 escapes get replaced, %20 becomes '+').
-    parts = urllib.parse.urlsplit(url)
+    if not isinstance(url, str) or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in url):
+        return ""
+    try:
+        parts = urllib.parse.urlsplit(url.strip())
+    except ValueError:
+        return ""
+    if parts.scheme.lower() not in ("http", "https") or not parts.netloc:
+        return ""
     kept = [pair for pair in parts.query.split("&") if not urllib.parse.unquote_plus(
         pair.partition("=")[0]).lower().startswith("utm_")] if parts.query else []
     out = urllib.parse.urlunsplit(parts._replace(query="&".join(kept)))
@@ -261,18 +413,19 @@ def _clean_url(url: str) -> str:
 
 def _format_source(src: dict) -> str:
     """One citation as [label](url); label falls back to attribution/domain."""
-    url = _clean_url(src["url"])
-    label = " ".join((src.get("title") or "").split())
+    if not isinstance(src, dict):
+        return ""
+    url = _clean_url(src.get("url", ""))
+    label = " ".join(str(src.get("title") or "").split())
     if not label:
-        label = " ".join((src.get("attr") or "").split())
-    if not label:
-        netloc = urllib.parse.urlsplit(src["url"]).netloc
+        label = " ".join(str(src.get("attr") or "").split())
+    if not label and url:
+        netloc = urllib.parse.urlsplit(url).netloc
         label = netloc[4:] if netloc.startswith("www.") else netloc
-        if not label:
-            return url
-    # brackets would break markdown link text in renderers without \-escape
-    # support (e.g. Discord); swap them out instead of escaping
-    return f"[{label.replace('[', '(').replace(']', ')')}]({url})"
+    label = label.replace("[", "(").replace("]", ")")
+    if not url:
+        return label
+    return f"[{label}]({url})" if label else url
 
 SOURCE_APPENDIX_MAX = 50
 
@@ -336,18 +489,39 @@ def _source_appendix(sources: list[dict], query: str = "") -> str:
     return "\n\n" + "\n".join(lines)
 
 
-def _format_entity(payload: str) -> str:
-    """Display name of an entity widget payload; "" when it cannot be parsed."""
+def _parse_entity(payload: str) -> tuple[str, Any, tuple[int, str, int] | None, bool] | None:
+    """Return (label, token, citation key, is_product) for one entity widget."""
     try:
         parsed = json.loads(payload.split("\ue202")[0])
     except Exception:
-        return ""
+        return None
     if isinstance(parsed, list):
-        parsed = parsed[1] if len(parsed) >= 2 and isinstance(parsed[1], str) else None
-    if not isinstance(parsed, str):
+        token = parsed[0] if parsed and isinstance(parsed[0], str) else None
+        label = next((item for item in parsed[1:] if isinstance(item, str) and item.strip()), "")
+        key = _cite_key(token)
+        is_product = parsed[0] == "product" if parsed else False
+        is_product = is_product or (key is not None and key[1] == "product")
+    elif isinstance(parsed, dict):
+        token = parsed.get("cite") or parsed.get("ref_id")
+        key = _cite_key(token)
+        kind = str(parsed.get("type") or "").lower()
+        is_product = kind in {"product", "product_entity"}
+        is_product = is_product or (key is not None and key[1] == "product")
+        label = parsed.get("title") or parsed.get("name") or ""
+    else:
+        return None
+    if not isinstance(label, str) or not label.strip():
+        return None
+    return " ".join(label.split()).replace("[", "(").replace("]", ")"), token, key, is_product
+
+
+def _format_entity(payload: str, cmap: dict[tuple[int, str, int], dict]) -> str:
+    """Render an entity; product entities retain an actionable markdown link."""
+    parsed = _parse_entity(payload)
+    if parsed is None:
         return ""
-    # same markdown-safety swaps as citation labels
-    return " ".join(parsed.split()).replace("[", "(").replace("]", ")")
+    label, token, _key, is_product = parsed
+    return _product_link(label, cmap, token) if is_product else label
 
 
 def _render_citations(raw: str, cmap: dict[tuple[int, str, int], dict], *,
@@ -368,7 +542,7 @@ def _render_citations(raw: str, cmap: dict[tuple[int, str, int], dict], *,
     safe = 0
     hold = -1  # display index from which output may still change
     matches = sorted((m for pat in (_CITE_BLOCK_RE, _ENTITY_BLOCK_RE, _LINK_BLOCK_RE,
-                                    _WIDGET_BLOCK_RE)
+                                    _PRODUCTS_BLOCK_RE, _WIDGET_BLOCK_RE)
                       for m in pat.finditer(raw)), key=lambda m: m.start())
     for m in matches:
         gap = raw[pos:m.start()]
@@ -385,31 +559,43 @@ def _render_citations(raw: str, cmap: dict[tuple[int, str, int], dict], *,
                 piece = " ".join(_format_source(s) for s in resolved)
             elif hold < 0:
                 hold = safe  # withhold this block (and everything after it)
+        elif m.group(0).startswith("\ue200products\ue202"):
+            if not final and _products_unresolved(m.group(1), cmap):
+                if hold < 0:
+                    hold = safe
+            else:
+                piece = _format_products(m.group(1), cmap)
         elif m.group(0).startswith("\ue200entity\ue202"):
-            # predicate must mirror _ENTITY_BLOCK_RE exactly: degenerate
-            # markers (\ue200entity\ue201, entity-named widgets) only match
-            # the group-less widget arm and have no group(1) to render.
-            piece = _format_entity(m.group(1))
+            parsed = _parse_entity(m.group(1))
+            if not final and parsed is not None and parsed[2] is not None and parsed[2] not in cmap:
+                if hold < 0:
+                    hold = safe  # sources may still arrive; hold the block
+            else:
+                piece = _format_entity(m.group(1), cmap)
         elif m.group(0).startswith(("\ue200url\ue202", "\ue200video\ue202")):
             # predicate must mirror _LINK_BLOCK_RE exactly: title is always
             # visible; target (group 2) is either a ref token resolved via
-            # cite_map or a raw URL. Unresolved ref tokens hold mid-stream and
-            # drop at final, like cite blocks.
+            # cite_map or a raw URL. Unresolved ref tokens hold mid-stream;
+            # final flush preserves the visible title if metadata never arrives.
             title = " ".join((m.group(1) or "").split()).replace("[", "(").replace("]", ")")
             target = (m.group(2) or "").strip()
             src: dict | None = None
             rt = _CITE_TOKEN_RE.fullmatch(target)
             if rt:
                 src = cmap.get((int(rt.group(1)), rt.group(2), int(rt.group(3))))
-                if src is None and not final:
-                    if hold < 0:
+                if src is None:
+                    if not final and hold < 0:
                         hold = safe  # sources may still arrive; hold the block
-                elif src is not None:
-                    piece = f"[{title}]({_clean_url(src['url'])})" if title else _format_source(src)
+                    elif final:
+                        piece = title
+                else:
+                    url = _clean_url(src.get("url", ""))
+                    piece = f"[{title}]({url})" if title and url else (title or _format_source(src))
             elif target.startswith(("http://", "https://")):
-                piece = f"[{title}]({_clean_url(target)})" if title else _clean_url(target)
+                url = _clean_url(target)
+                piece = f"[{title}]({url})" if title and url else (title or url)
             elif title.startswith(("http://", "https://")):
-                piece = _clean_url(title)  # two-part form: the URL IS the payload
+                piece = _clean_url(title) or title  # two-part form: the URL IS the payload
             else:
                 piece = title  # no/unknown target: the title itself is the content
         elif charts_out is not None and m.group(0).startswith(_GENUI_PREFIX):
