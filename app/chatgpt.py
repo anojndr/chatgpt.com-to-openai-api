@@ -321,14 +321,19 @@ class AccountSession:
                     log.warning("[%s] conversation 401, retried after token refresh", self.email)
                     continue
                 break
-            if r.status_code == 429:
-                raise ChatGPTError(429, r.text[:300])
-            if r.status_code == 403:
-                raise ChatGPTError(403, r.text[:300])
             if r.status_code == 401:
                 raise ChatGPTError(401, "unauthorized")
             if r.status_code != 200:
-                raise ChatGPTError(r.status_code, r.text[:500])
+                # 429/403 bodies (quota/sentinel pages) get a tighter excerpt.
+                limit = 300 if r.status_code in (429, 403) else 500
+                try:
+                    err_text = await r.atext()
+                except Exception:
+                    # Upstream aborted the error body mid-read. The HTTP status
+                    # is the actionable part -- pool cooldown keys off e.status
+                    # -- so never let a raw transport exception mask it.
+                    err_text = ""
+                raise ChatGPTError(r.status_code, err_text[:limit])
             async for raw in r.aiter_lines():
                 if not isinstance(raw, str):
                     raw = raw.decode()
