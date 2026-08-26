@@ -898,6 +898,19 @@ async def run_turn(
                 # assistant role; their string parts (when present) are
                 # internal channel data and must never stream as the answer.
                 is_text_node = (content.get("content_type") or "text") == "text"
+                # Upstream moderation/policy errors arrive as HTTP-200 SSE nodes
+                # flagged metadata.is_error=true, with no "next" marker. Raise
+                # BEFORE any byte of the error text streams so nothing is
+                # produced and pool failover can retry on another account --
+                # moderation verdicts are model/plan-tier dependent (a free
+                # account's refusal is routinely servable by a plus account).
+                if (author.get("role") == "assistant" and is_text_node
+                        and (m.get("metadata") or {}).get("is_error")):
+                    err_text = " ".join(str(p) for p in parts if isinstance(p, str)).strip()
+                    raise ChatGPTError(
+                        502,
+                        f"[{acct.email}] ChatGPT rejected this prompt: {err_text[:200]}",
+                    )
                 for p in parts:
                     if isinstance(p, dict):
                         ptr = p.get("asset_pointer")
