@@ -262,7 +262,7 @@ class ConversationStore:
         return None
 
     def record_turn(self, hashes: list[str], ref: ConvRef) -> None:
-        """Store hash chain entries covering the whole updated history."""
+        """Store hash chain entries for turn prefix hashes."""
         if not hashes:
             return
         now = time.time()

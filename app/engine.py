@@ -1029,7 +1029,8 @@ async def run_turn(
             created = int(time.time())
 
             new_ref = ConvRef(acct.identity, cid, parent, len(parsed.items), time.time())
-            STORE.record_turn(hashes, new_ref)
+            if hashes:
+                STORE.record_turn([hashes[-1]], new_ref)
             # Record CUMULATIVE context: stateful clients send only new items per
             # call, so a delta-only snapshot would lose earlier turns on a later
             # failover (chained via previous_response_id).

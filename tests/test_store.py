@@ -62,6 +62,46 @@ class TestConversationStoreSqlite(unittest.TestCase):
         self.assertEqual(matched_prefix[0], 2)
         self.assertEqual(matched_prefix[1].conversation_id, "conv_abc")
 
+
+    def test_branching_conversation_parent_ids(self):
+        # Turn 1: user says "my name is tyler" (request items: [user_item])
+        # engine computes hashes = [h1], records [h1] -> ref1
+        h1 = item_hash("", "user", "my name is tyler")
+        ref1 = ConvRef(account_identity="user_1", conversation_id="conv_1", parent_id="msg_asst_1", turns=1, updated=time.time())
+        self.store.record_turn([h1], ref1)
+
+        # Turn 2: user says "what is my name again?" (request items: [user1, asst1, user2])
+        # engine computes hashes = [h1, h2, h3], records [h3] -> ref2
+        h2 = item_hash(h1, "assistant", "Nice to meet you, Tyler.")
+        h3 = item_hash(h2, "user", "what is my name again?")
+        ref2 = ConvRef(account_identity="user_1", conversation_id="conv_1", parent_id="msg_asst_2", turns=3, updated=time.time())
+        self.store.record_turn([h3], ref2)
+
+        # Branch A (Turn 3): user says "remember code X" (request items: [user1, asst1, user2, asst2, user3_a])
+        # engine computes hashes = [h1, h2, h3, h4, h5_a], records [h5_a] -> ref3_a
+        h4 = item_hash(h3, "assistant", "Your name is Tyler.")
+        h5_a = item_hash(h4, "user", "remember code X")
+        ref3_a = ConvRef(account_identity="user_1", conversation_id="conv_1", parent_id="msg_asst_3_code", turns=5, updated=time.time())
+        self.store.record_turn([h5_a], ref3_a)
+
+        # Now, Branch B forks from Turn 2 (request items: [user1, asst1, user2, asst2, user3_b])
+        # where user3_b is "what code did I ask you to remember?"
+        h5_b = item_hash(h4, "user", "what code did I ask you to remember?")
+        matched = self.store.find([h1, h2, h3, h4, h5_b])
+        self.assertIsNotNone(matched)
+        # Longest prefix match should match up to h3 (length 3) and return ref2 with msg_asst_2
+        self.assertEqual(matched[0], 3)
+        self.assertEqual(matched[1].parent_id, "msg_asst_2")
+        self.assertEqual(matched[1].conversation_id, "conv_1")
+
+        # Also verify branching directly from Turn 1
+        h3_c = item_hash(h2, "user", "different question branching from turn 1")
+        matched_from_turn1 = self.store.find([h1, h2, h3_c])
+        self.assertIsNotNone(matched_from_turn1)
+        self.assertEqual(matched_from_turn1[0], 1)
+        self.assertEqual(matched_from_turn1[1].parent_id, "msg_asst_1")
+        self.assertEqual(matched_from_turn1[1].conversation_id, "conv_1")
+
     def test_response_and_snapshot_persistence(self):
         img = ImageInput(filename="test.png", mime="image/png", data=b"\x89PNG\r\n\x1a\n\x00test")
         file_att = FileInput(filename="doc.txt", mime="text/plain", data=b"Document content here")
