@@ -81,6 +81,8 @@ IMAGE_LIMIT_RE = re.compile(
     r"image\s+generation\s+isn['’]t\s+available\s+in\s+this\s+chat(?:\s+right\s+now)?"
     r"|"
     r"log\s+in\s+to\s+(?:generate|create|edit)\s+images?"
+    r"|"
+    r"it\s+looks\s+like\s+(?:image\s+(?:creation|generation|editing)|image\s+requests?)\s+(?:is|are)\s+(?:currently\s+|temporarily\s+)?unavailable"
     r")",
     re.IGNORECASE | re.DOTALL,
 )
@@ -100,7 +102,16 @@ _LIMIT_STARTERS = ("you've hit the ", "you have hit the ", "you've hit your ", "
     "i can generate that image, but ",
     "log in to generate ",
     "log in to create ",
-    "log in to edit ",)
+    "log in to edit ",
+    # Temporary-unavailability refusal ("It looks like image creation is
+    # temporarily unavailable. Do you want to try something else?"): same
+    # account-failover treatment as quota/login refusals. One generic starter,
+    # not exact strings: every IMAGE_LIMIT_RE variant of this template
+    # (currently/temporarily, is/are, request(s), creation/generation/
+    # editing) must stay HELD past the noun until the regex confirms --
+    # exact-string starters release other variants' bytes mid-stream, which
+    # sets produced=True and aborts account failover.
+    "it looks like image ",)
 _PLAN_WORDS = ("free", "plus", "pro", "team", "enterprise")
 # After a full non-quota starter match ("image generation requires..."), only these
 # next words can still grow into a refusal; anything else ("requires a lot of...")
@@ -112,6 +123,11 @@ def _refusal_next_words(starter):
         return ("images",)          # "log in to generate/create/edit images"
     if starter.startswith("i can "):
         return ("image",)           # "...but image generation isn't available"
+    if starter.startswith("it looks like image "):
+        # Noun gate: only these can still grow into "image <noun> is/are
+        # ... unavailable"; anything else ("image quality...") proves a
+        # normal reply and releases immediately.
+        return ("creation", "generation", "editing", "request")
     if "require" in starter:
         return ("log", "you", "being", "to")  # logging/logged in, you to be, being, to be
     return None  # no gate known: hold until the regex or max-len releases
