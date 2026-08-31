@@ -231,6 +231,13 @@ _PRODUCTS_BLOCK_RE = re.compile("\\ue200products\\ue202([^\\ue201]*?)\\ue201")
 _WIDGET_BLOCK_RE = re.compile(
     "\\ue200(?!cite\\ue202turn)(?!entity\\ue202)(?!url\\ue202)(?!video\\ue202)(?!products\\ue202)"
     "(?:navlist|[a-z_]+)(?:\\ue202[^\\ue201]*?)?\\ue201")
+# The concurrent-generation stream variant serializes citations as JSX
+# instead of \ue200 blocks:  <Cite refs={["turn0news9","turn0search10"]}/>
+# (seen on gpt-5-6 branch races; both ref= and refs= spellings occur).
+# Well-formed tags carry at least one turn-ref token and resolve through the
+# same cite_map as PUA cite blocks; a token-free match is legit code content
+# and must stay untouched.
+_CITE_TAG_RE = re.compile(r"<Cite\b[^>\n]*?/>")
 _PUA_CHARS_RE = re.compile("[\\ue200-\\ue205]")
 _GENUI_PREFIX = "\ue200genui"
 
@@ -540,6 +547,26 @@ def _format_entity(payload: str, cmap: dict[tuple[int, str, int], dict]) -> str:
     return _product_link(label, cmap, token) if is_product else label
 
 
+def _jsx_cite_cut(raw: str, final: bool = False) -> int:
+    """Start index of a trailing UNCLOSED <Cite fragment worth withholding,
+    or -1. A half-streamed citation tag (<Cite ref={["turn0search1) must
+    never reach the client: it completes in a later cumulative snapshot.
+    Mid-stream (final=False) ANY single-line unclosed fragment is withheld:
+    even a token-free stub can complete into a resolvable tag later, and
+    bytes emitted now could never match the re-rendered prefix. At final the
+    token/120 gates decide keep-vs-drop: multi-line or token-free <Cite
+    occurrences are code content and stay untouched."""
+    p = raw.rfind("<Cite")
+    if p < 0:
+        return -1
+    frag = raw[p:]
+    if "/>" in frag or "\n" in frag:
+        return -1
+    if final and not (_CITE_TOKEN_RE.search(frag) or len(frag) <= 120):
+        return -1
+    return p
+
+
 def _render_citations(raw: str, cmap: dict[tuple[int, str, int], dict], *,
                       final: bool = False,
                       charts_out: list[dict] | None = None) -> tuple[str, int]:
@@ -557,8 +584,16 @@ def _render_citations(raw: str, cmap: dict[tuple[int, str, int], dict], *,
     pos = 0
     safe = 0
     hold = -1  # display index from which output may still change
-    matches = sorted((m for pat in (_CITE_BLOCK_RE, _ENTITY_BLOCK_RE, _LINK_BLOCK_RE,
-                                    _PRODUCTS_BLOCK_RE, _WIDGET_BLOCK_RE)
+    if not final:
+        # A half-received JSX citation tag (<Cite ref={["turn0search1) must
+        # never reach the client: it completes in a later cumulative
+        # snapshot. Cut it and everything after; a complete tag renders
+        # through the cite arm below.
+        cut = _jsx_cite_cut(raw)
+        if cut >= 0:
+            raw = raw[:cut]
+    matches = sorted((m for pat in (_CITE_BLOCK_RE, _CITE_TAG_RE, _ENTITY_BLOCK_RE,
+                                    _LINK_BLOCK_RE, _PRODUCTS_BLOCK_RE, _WIDGET_BLOCK_RE)
                       for m in pat.finditer(raw)), key=lambda m: m.start())
     for m in matches:
         gap = raw[pos:m.start()]
@@ -567,7 +602,24 @@ def _render_citations(raw: str, cmap: dict[tuple[int, str, int], dict], *,
             safe += len(gap)
         pos = m.end()
         piece = ""
-        if m.group(0).startswith("\ue200cite"):
+        if m.re is _CITE_TAG_RE:
+            # Concurrent-generation stream variant: JSX citation tag. The
+            # final texts of those streams carry ZERO content_references, so
+            # the tokens can never resolve -- drop the tag and keep the
+            # sentence clean. Resolve via cmap if sources ever do arrive.
+            # A token-free match is code content that merely looks like a
+            # citation tag and must pass through untouched.
+            tokens = _CITE_TOKEN_RE.findall(m.group(0))
+            sources = [cmap.get((int(t), rt, int(n))) for t, rt, n in tokens]
+            resolved = [s for s in sources if s]
+            if not tokens:
+                piece = m.group(0)
+            elif len(resolved) == len(tokens):
+                piece = " ".join(_format_source(s) for s in resolved)
+            elif not final:
+                if hold < 0:
+                    hold = safe  # sources may still arrive; hold the block
+        elif m.group(0).startswith("\ue200cite"):
             tokens = _CITE_TOKEN_RE.findall(m.group(0))
             sources = [cmap.get((int(t), rt, int(n))) for t, rt, n in tokens]
             resolved = [s for s in sources if s]
@@ -648,7 +700,12 @@ def _render_citations(raw: str, cmap: dict[tuple[int, str, int], dict], *,
     text = "".join(out)
     if final:
         # end of stream: drop leftover invisible marker scaffolding (stray
-        # delimiters/separators); visible content is never made of these
+        # delimiters/separators); visible content is never made of these.
+        # A still-unclosed JSX citation fragment (stream died mid-tag) is
+        # scaffolding too -- it always sits at the very end.
+        cut = _jsx_cite_cut(text, final=True)
+        if cut >= 0:
+            text = text[:cut]
         text = _PUA_CHARS_RE.sub("", text)
         return text, len(text)
     return text, min(safe, len(text))
@@ -902,11 +959,6 @@ async def run_turn(
                     last_node_id = m["id"]
                 if author.get("role") not in ("assistant", "tool"):
                     continue
-                if author.get("role") == "assistant" and m.get("id") and m["id"] != current_msg_id:
-                    # new assistant node: restart delta accounting so its text streams
-                    current_msg_id = m["id"]
-                    emitted = 0
-                    text_acc = ""
                 content = m.get("content") or {}
                 parts = content.get("parts") or []
                 # Only 'text' nodes carry client-visible prose. thoughts/code/
@@ -914,6 +966,30 @@ async def run_turn(
                 # assistant role; their string parts (when present) are
                 # internal channel data and must never stream as the answer.
                 is_text_node = (content.get("content_type") or "text") == "text"
+                if author.get("role") == "assistant" and m.get("id") and m["id"] != current_msg_id:
+                    # Upstream occasionally serves one turn as MULTIPLE
+                    # concurrent generation branches -- parallel
+                    # code->tool->thoughts->text chains under one user node,
+                    # interleaved in the SSE (stored server-side for conv
+                    # 6a94e940-9e0c-83ec-9856-de304ad81252, account
+                    # rjandrongian@gmail.com, model gpt-5-6). Every branch
+                    # re-sends its own cumulative snapshot, so restarting
+                    # accounting here re-emits each branch from byte 0 on
+                    # every switch -- the garbled overlapping output clients
+                    # received. Adopt a new node only when it plausibly
+                    # CONTINUES the streamed text (nothing streamed yet, or
+                    # its snapshot extends the accumulated prefix, e.g. a
+                    # message_type=continue node); an unrelated node belongs
+                    # to a rival branch: its metadata still feeds the maps
+                    # below, but its text is never streamed and accounting is
+                    # never reset for it.
+                    rival = text_acc and not any(
+                        isinstance(p, str) and p.startswith(text_acc) for p in parts)
+                    if not rival:
+                        current_msg_id = m["id"]
+                        if not text_acc:
+                            emitted = 0
+                            text_acc = ""
                 # Upstream moderation/policy errors arrive as HTTP-200 SSE nodes
                 # flagged metadata.is_error=true, with no "next" marker. Raise
                 # BEFORE any byte of the error text streams so nothing is
@@ -932,7 +1008,8 @@ async def run_turn(
                         ptr = p.get("asset_pointer")
                         if isinstance(ptr, str) and "sediment://" in ptr and ptr not in sediment:
                             sediment.append(ptr)
-                    elif isinstance(p, str) and author.get("role") == "assistant" and is_text_node:
+                    elif isinstance(p, str) and author.get("role") == "assistant" and is_text_node \
+                            and (not m.get("id") or m["id"] == current_msg_id):
                         text_acc = p
                         # Withhold bytes while they could still be the image-limit
                         # refusal: once visible, accounts can no longer be switched.
@@ -949,7 +1026,14 @@ async def run_turn(
                     break
                 meta = m.get("metadata") or {}
                 if meta.get("message_type") in ("next", "continue"):
-                    parent = m.get("id") or parent
+                    # A rival branch's completion marker must not repoint the
+                    # stored conversation parent away from the branch the
+                    # client actually received. An unadopted assistant marker
+                    # is always a rival's: a node that streamed text would
+                    # have been adopted within its own event.
+                    if not (author.get("role") == "assistant" and m.get("id")
+                            and m["id"] != current_msg_id):
+                        parent = m.get("id") or parent
 
             # Refusals are valid HTTP-200 streams and may intentionally stop
             # before ChatGPT emits the normal assistant "next" marker.
@@ -971,9 +1055,11 @@ async def run_turn(
                         if last_event else "; stream ended without any events")
                 raise EngineError(502, "ChatGPT returned an incomplete response" + tail)
             if not parent:
-                # Keep the stored conversation continuable: parent the next turn
-                # to the last node we saw (the tool node) instead of "".
-                parent = last_node_id
+                # Keep the stored conversation continuable: parent the next
+                # turn to the branch the client actually received (the
+                # adopted assistant node), falling back to the last node we
+                # saw (e.g. a tool node that carries the sediment pointer).
+                parent = current_msg_id or last_node_id
             # Flush anything still withheld first: short normal replies that
             # begin like the refusal must reach the client in full. final=True
             # also releases citation blocks whose sources never arrived.
