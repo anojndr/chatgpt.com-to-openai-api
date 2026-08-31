@@ -41,12 +41,27 @@ account 2:
 ```
 
 - Add or remove blocks while the server runs — the pool hot-reloads within ~2 s (dedup by user id).
+- **Sessions never expire on their own.** A keepalive sweep refreshes every
+  access token long before its ~10-day JWT expiry (which also re-issues the
+  rolling session cookie), and the fresh session JSON + rotated cookies are
+  written back into that account's block in `accounts.txt` (atomic, `flock`ed,
+  `accounts.txt.tmp` + rename) — the file always tracks the live session
+  state, so restarts pick up exactly where the pool left off. A 200 from
+  `/api/auth/session` without a usable token counts one strike;
+  `KEEPALIVE_MAX_STRIKES` consecutive strikes (transient network/5xx errors never
+  strike; strikes older than two sweep intervals are forgiven) pull the account
+  from rotation as `needs re-login` — the only way an
+  account stops working is ChatGPT revoking the login itself. Dead accounts
+  are re-probed every `KEEPALIVE_REVIVE_SECONDS`, and pasting a fresher
+  cookie-jar + session-JSON export over a block hot-swaps it instantly
+  (fresher = the embedded JWT outlives the current one by
+  `KEEPALIVE_MIN_IMPROVEMENT`), reviving it without a restart.
 - Load balancing: fair least-in-flight / least-recently-used rotation across ALL accounts; 429s put an account on cooldown (free 15 min, plus 2 min).
 - Failover: if a request fails on one account (429/403/5xx/transport error), EVERY other available account is tried exactly once before an error is returned. Attempts served by a different account rebuild the full conversation from scratch (see "Multi-turn design"), so nothing is lost — text, images, and binary files alike are replayed onto the account that actually serves the turn.
 - Image-limit refusals: when ChatGPT answers with "You've hit the ... plan limit for image generations requests ...", that account is put on cooldown like a 429 and the request is retried on the next available account — before any of the refusal text reaches your client. Only if every account is image-limited does the request fail (429), carrying the last refusal message.
 - Image generation and editing login refusals: if ChatGPT answers with "Image generation and image editing require you to be logged in...", the proxy treats it as an image refusal on that account, cooling it down and seamlessly failing over to another account.
 - Temporary-unavailability refusals: if ChatGPT answers with "It looks like image creation is temporarily unavailable. Do you want to try something else?", the same treatment applies — the refusal is withheld, the account is cooled down like a 429, and every remaining account is tried before any failure is reported.
-- Session cookies authenticate most backend-api calls even when the embedded access-token JWT has expired — but file uploads and image generations are **Bearer-authenticated** (backend-api / conversation image generation requires an active authenticated session). Tokens refresh opportunistically via `/api/auth/session`; if that endpoint keeps returning a token that is already expired, the session cookie itself is stale. Such accounts log `needs re-login` and skip uploads immediately instead of failing mid-upload — replace their block in `accounts.txt` with a fresh cookie-jar + session-JSON export to restore image/file requests.
+- Session cookies authenticate most backend-api calls even when the embedded access-token JWT has expired — but file uploads and image generations are **Bearer-authenticated** (backend-api / conversation image generation requires an active authenticated session). Keepalive keeps tokens fresh automatically (see above); an account only degrades to cookie-only/`needs re-login` if ChatGPT has actually killed the session, and a fresh export pasted over its block restores it immediately — no restart needed.
 - For tests you can pin an account with header `x-chatgpt-account: <email>`.
 
 ## Endpoints

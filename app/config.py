@@ -35,10 +35,26 @@ COOLDOWN_PLUS_SECONDS: int = int(os.environ.get("COOLDOWN_PLUS_SECONDS", "120"))
 REQUIREMENTS_TTL: int = int(os.environ.get("REQUIREMENTS_TTL", "480"))  # server says 540
 CONVERSATION_TTL_HOURS: float = float(os.environ.get("CONVERSATION_TTL_HOURS", "168"))
 # Context snapshots retained per response so account failover can replay the
-# full conversation (text + binaries) on another account. Per-response cap
-# bounds one snapshot's binaries; the store-wide budget evicts oldest first.
+# full conversation (text + binaries), capped by SNAPSHOT_FILE_CAP_MB and
+# SNAPSHOT_STORE_CAP_MB.
 SNAPSHOT_FILE_CAP_MB: int = int(os.environ.get("SNAPSHOT_FILE_CAP_MB", "32"))
 SNAPSHOT_STORE_CAP_MB: int = int(os.environ.get("SNAPSHOT_STORE_CAP_MB", "256"))
+
+# --- session keepalive: keep accounts.txt sessions alive indefinitely ---
+# Sweep interval: every account is checked once per tick.
+KEEPALIVE_SECONDS: int = int(os.environ.get("KEEPALIVE_SECONDS", "600"))
+# Refresh the access token when less than this much validity remains, so the
+# JWT never lapses and the rolling session cookie keeps being exercised.
+KEEPALIVE_REFRESH_WITHIN: int = int(os.environ.get("KEEPALIVE_REFRESH_WITHIN", "86400"))
+# A 200 from /api/auth/session without a usable token counts one strike;
+# this many spaced strikes pull the account from rotation as needing re-login.
+KEEPALIVE_MAX_STRIKES: int = int(os.environ.get("KEEPALIVE_MAX_STRIKES", "3"))
+# Dead accounts are re-probed this often and revived automatically if the
+# stored cookie jar produces a fresh token again.
+KEEPALIVE_REVIVE_SECONDS: int = int(os.environ.get("KEEPALIVE_REVIVE_SECONDS", "900"))
+# A pasted block only hot-swaps if its JWT outlives the in-memory one by this
+# much (prevents churn from borderline exports).
+KEEPALIVE_MIN_IMPROVEMENT: float = float(os.environ.get("KEEPALIVE_MIN_IMPROVEMENT", "300"))
 
 USER_AGENT: str = os.environ.get(
     "UA",

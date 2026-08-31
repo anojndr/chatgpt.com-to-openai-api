@@ -1,6 +1,8 @@
 # secrets & credentials — never commit
 .env
 accounts.txt
+accounts.txt.lock
+accounts.txt.tmp
 
 # runtime artifacts
 server.log

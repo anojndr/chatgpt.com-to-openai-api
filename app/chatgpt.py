@@ -42,12 +42,14 @@ class ChatGPTError(Exception):
         self.message = message
 
 
+BLOCK_RE = re.compile(r"^<<<\s*$(.*?)^>>>\s*$", re.S | re.M)
+
+
 def parse_accounts_text(text: str) -> list[dict[str, Any]]:
     """Parse accounts.txt: '<<<' ... '>>>' blocks with a netscape cookie jar and
     the JSON body of https://chatgpt.com/api/auth/session."""
-    blocks = re.findall(r"^<<<\s*$(.*?)^>>>\s*$", text, re.S | re.M)
     accounts: list[dict[str, Any]] = []
-    for b in blocks:
+    for b in BLOCK_RE.findall(text):
         m = re.search(r"from https://chatgpt\.com/api/auth/session:\s*(\{.*)", b, re.S)
         if not m:
             continue
@@ -56,23 +58,45 @@ def parse_accounts_text(text: str) -> list[dict[str, Any]]:
         except json.JSONDecodeError:
             continue
         cookies: dict[str, str] = {}
+        raw_cookie_lines: list[str] = []
         for line in b.splitlines():
             line = line.strip()
-            if line.startswith("#HttpOnly_"):
-                line = line[len("#HttpOnly_"):]  # standard netscape-jar HttpOnly marker
-            if not line or line.startswith("#") or "\t" not in line:
+            marker = "#HttpOnly_" if line.startswith("#HttpOnly_") else ""
+            bare = line[len(marker):]  # standard netscape-jar HttpOnly marker
+            if not bare or bare.startswith("#") or "\t" not in bare:
                 continue
-            parts = line.split("\t")
+            parts = bare.split("\t")
             if len(parts) >= 7:
                 cookies[parts[5]] = parts[6]
+                raw_cookie_lines.append(line)  # marker kept for round-trip
         if not sess.get("accessToken"):
             continue
         accounts.append({
             "session": sess,
             "cookies": cookies,
+            "raw_cookie_lines": raw_cookie_lines,
             "identity": sess.get("user", {}).get("id") or sess.get("account", {}).get("id"),
         })
     return accounts
+
+
+def block_session(block_text: str) -> dict[str, Any] | None:
+    """Session JSON of one raw '<<<' ... '>>>' block body, or None."""
+    m = re.search(r"from https://chatgpt\.com/api/auth/session:\s*(\{.*)", block_text, re.S)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(1).strip())
+    except json.JSONDecodeError:
+        return None
+
+
+def block_identity(block_text: str) -> str | None:
+    """Identity of one raw '<<<' ... '>>>' block body (for block replacement)."""
+    sess = block_session(block_text)
+    if not sess:
+        return None
+    return sess.get("user", {}).get("id") or sess.get("account", {}).get("id")
 
 
 class AccountSession:
@@ -82,6 +106,7 @@ class AccountSession:
         self.identity: str = parsed["identity"]
         self.session_json: dict[str, Any] = parsed["session"]
         self.cookies: dict[str, str] = dict(parsed["cookies"])
+        self.raw_cookie_lines: list[str] = list(parsed.get("raw_cookie_lines") or [])
         s = parsed["session"]
         self.access_token: str = s["accessToken"]
         self._jwt_exp: float = _jwt_exp(self.access_token)
@@ -95,6 +120,13 @@ class AccountSession:
         self.total_requests: int = 0
         self.cooldown_until: float = 0.0
         self.dead: bool = False
+        # keepalive state
+        self.refresh_strikes: int = 0
+        self._last_strike_at: float = 0.0
+        self.revive_after: float = 0.0
+        self.state_dirty: bool = False
+        self._refreshing: bool = False   # network refresh in flight
+        self._refresh_ok: bool = False   # last completed refresh succeeded
         # http/sentinel state
         self._http: AsyncSession | None = None
         self._req: Requirements | None = None
@@ -136,53 +168,169 @@ class AccountSession:
 
     # ---------- auth ----------
     async def refresh_access_token(self) -> bool:
+        """Refresh via /api/auth/session. On any successful refresh the
+        rotated session cookies are absorbed into self.cookies and marked
+        dirty; the pool persists dirty state into accounts.txt.
+
+        Failure policy: transport errors / non-200 / non-JSON responses are
+        transient (return False, no strike). A 200 that cannot yield a
+        fresh-enough token counts one strike; KEEPALIVE_MAX_STRIKES spaced
+        strikes mean the session cookie itself is stale -> dead (needs
+        re-login)."""
         try:
-            s = await self.http()
-            r = await s.get(f"{CHATGPT_ORIGIN}/api/auth/session",
-                            headers={"Accept": "*/*"}, timeout=30)
-            if r.status_code != 200:
-                log.warning("[%s] session refresh HTTP %s", self.email, r.status_code)
-                return False
-            j = r.json()
-            new_at = j.get("accessToken")
-            if not new_at:
-                self.dead = True
-                log.warning("[%s] session cookie expired (no accessToken)", self.email)
-                return False
-            new_exp = _jwt_exp(new_at)
-            if not new_exp or new_exp <= time.time() + 60:
-                # /api/auth/session can keep serving a cached token past its exp
-                # when the session cookie itself is stale. Storing it would log
-                # "refreshed" while every Bearer-gated call keeps 401-ing.
-                log.warning("[%s] session returned an %s access token (%ss left); "
-                            "account needs re-login for bearer-authenticated calls",
-                            self.email, "unparseable" if not new_exp else "expired",
-                            max(0.0, (new_exp or 0.0) - time.time()))
-                # Confirmed stale: the session cookie itself can no longer
-                # produce a usable token, so keep this account out of rotation
-                self.dead = True
-                return False
-            self.access_token = new_at
-            self._jwt_exp = _jwt_exp(new_at)
-            self.session_json = j
-            exp = _parse_expires(j.get("expires"))
-            if exp:
-                self.expires_at = exp
-            plan = (j.get("account") or {}).get("planType")
-            if plan:
-                self.plan = plan
-            self._req = None
-            log.info("[%s] access token refreshed", self.email)
-            return True
+            # One refresh per account at a time; request paths and the
+            # keepalive sweep all funnel through here. While one is in
+            # flight (or concluded <5s ago) report the cached outcome
+            # instead of firing a second request.
+            if self._refreshing or time.time() - self._last_refresh_attempt < 5:
+                return bool(self._refresh_ok and self.access_token
+                            and time.time() < self._jwt_exp - 60)
+            self._last_refresh_attempt = time.time()
+            self._refreshing = True
+            try:
+                return await self._do_refresh()
+            finally:
+                self._refreshing = False
         except Exception as e:
+            self._refresh_ok = False
             log.warning("[%s] refresh failed: %s", self.email, e)
             return False
 
+    async def _do_refresh(self) -> bool:
+        self._refresh_ok = False
+        s = await self.http()
+        r = await s.get(f"{CHATGPT_ORIGIN}/api/auth/session",
+                        headers={"Accept": "*/*"}, timeout=30)
+        if r.status_code != 200:
+            log.warning("[%s] session refresh HTTP %s", self.email, r.status_code)
+            return False
+        try:
+            j = r.json()
+        except Exception:
+            log.warning("[%s] session refresh returned non-JSON body", self.email)
+            return False
+        self._absorb_cookies(r)
+        new_at = j.get("accessToken")
+        if not new_at:
+            return self._record_refresh_failure("session returned no accessToken")
+        new_exp = _jwt_exp(new_at)
+        if not new_exp or new_exp <= time.time() + 60:
+            # /api/auth/session can keep serving a cached token past its
+            # exp when the session cookie itself is stale. Never adopt it.
+            return self._record_refresh_failure(
+                "session returned an %s access token (%ss left)" % (
+                    "unparseable" if not new_exp else "expired",
+                    max(0.0, (new_exp or 0.0) - time.time())))
+        self.access_token = new_at
+        self._jwt_exp = new_exp
+        self.session_json = j
+        exp = _parse_expires(j.get("expires"))
+        if exp:
+            self.expires_at = exp
+        plan = (j.get("account") or {}).get("planType")
+        if plan:
+            self.plan = plan
+        self._req = None
+        self.refresh_strikes = 0
+        self.dead = False
+        self.state_dirty = True
+        self._refresh_ok = True
+        log.info("[%s] access token refreshed", self.email)
+        return True
+
+    def _record_refresh_failure(self, detail: str) -> bool:
+        """A confirmed-but-unusable session response. Counts one strike;
+        strikes older than two sweep intervals are forgiven first, so only
+        KEEPALIVE_MAX_STRIKES consecutive failures mark the account dead."""
+        now = time.time()
+        if now - self._last_strike_at > 2 * config.KEEPALIVE_SECONDS:
+            self.refresh_strikes = 0  # stale evidence: not a consecutive run
+        self._last_strike_at = now
+        self.refresh_strikes += 1
+        if self.refresh_strikes >= config.KEEPALIVE_MAX_STRIKES:
+            self.dead = True
+            self.revive_after = now + config.KEEPALIVE_REVIVE_SECONDS
+            log.warning("[%s] needs re-login (%s; %d strikes)", self.email, detail,
+                        self.refresh_strikes)
+        else:
+            log.warning("[%s] refresh unusable: %s (strike %d/%d)", self.email, detail,
+                        self.refresh_strikes, config.KEEPALIVE_MAX_STRIKES)
+        return False
+
+    def _absorb_cookies(self, r: Any) -> None:
+        """Merge session cookies rotated by the server into account state and
+        regenerate raw_cookie_lines so accounts.txt stays re-exportable."""
+        try:
+            get_list = getattr(r.headers, "get_list", None)
+            if get_list is not None:
+                headers = get_list("set-cookie") or []
+            else:
+                # Generic fallback: multi_items keeps one entry per header,
+                # unlike get() which comma-joins and garbles Expires dates.
+                headers = [v for k, v in r.headers.multi_items()
+                           if k.lower() == "set-cookie"]
+        except Exception:
+            return
+        import http.cookies
+        sc = http.cookies.SimpleCookie()
+        for header in headers:
+            if not header:
+                continue
+            try:
+                sc.load(header)
+            except Exception:
+                continue  # malformed/obfuscated cookie (e.g. Cloudflare challenge)
+        if not sc:
+            return
+        merged = 0
+        for name, morsel in sc.items():
+            value = morsel.value
+            # Empty value == deletion cookie (tok=; Expires=<past>). Adopting
+            # it would wipe the stored value for a challenge/glitch response,
+            # which is unrecoverable — keeping the stale cookie is not.
+            if not value:
+                continue
+            if self.cookies.get(name) == value:
+                continue
+            self.cookies[name] = value
+            merged += 1
+        if not merged:
+            return
+        if self._http is not None:
+            for name in sc.keys():
+                if name in self.cookies:
+                    self._http.cookies.set(name, self.cookies[name],
+                                           domain=".chatgpt.com", path="/")
+        self._rebuild_raw_cookie_lines()
+        self.state_dirty = True
+        log.info("[%s] absorbed %d rotated session cookie(s)", self.email, merged)
+
+    def _rebuild_raw_cookie_lines(self) -> None:
+        """Regenerate netscape rows from raw_cookie_lines + self.cookies,
+        replacing values of cookies the server rotated."""
+        lines: list[str] = []
+        seen: set[str] = set()
+        for line in self.raw_cookie_lines:
+            parts = line.split("\t")
+            if len(parts) >= 7 and parts[5] in self.cookies:
+                parts[6] = self.cookies[parts[5]]
+                line = "\t".join(parts)
+                seen.add(parts[5])
+            lines.append(line)
+        for name, value in self.cookies.items():
+            if name in seen:
+                continue
+            lines.append(".chatgpt.com\tTRUE\t/\tTRUE\t0\t%s\t%s" % (name, value))
+        self.raw_cookie_lines = lines
+
     async def ensure_token(self) -> None:
         # JWT expiry is authoritative; session-cookie auth covers us regardless.
+        # refresh_access_token self-throttles; this gate reads the CURRENT
+        # attempt stamp (never pre-set it here — that turned this into a
+        # silent no-op) and spaces nudges to once a minute so a busy
+        # final-600s window can't hammer /api/auth/session.
         if self.access_token and time.time() > self._jwt_exp - 600:
-            if time.time() - self._last_refresh_attempt > 600:
-                self._last_refresh_attempt = time.time()
+            if time.time() - self._last_refresh_attempt > 60:
                 await self.refresh_access_token()
 
     # ---------- sentinel ----------
