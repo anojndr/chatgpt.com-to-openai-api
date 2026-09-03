@@ -5,7 +5,7 @@ Exposes ChatGPT web accounts as a local **OpenAI-compatible API** (Chat Completi
 ## Quick start
 
 ```bash
-./run.sh                 # creates .venv if missing, serves http://0.0.0.0:4035
+./run.sh                 # creates .venv if missing, serves http://127.0.0.1:4035 (HOST=0.0.0.0 for LAN)
 ```
 
 Configuration lives in `.env` (never commit real keys):

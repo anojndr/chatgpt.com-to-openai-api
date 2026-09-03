@@ -1,0 +1,53 @@
+[project]
+name = "chatgpt-to-openai-api"
+version = "1.0.0"
+description = "Expose ChatGPT web accounts as a local OpenAI-compatible API"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "curl_cffi>=0.7",
+    "pillow",
+]
+
+[tool.uv]
+package = false
+required-version = ">=0.12.9"
+[dependency-groups]
+dev = ["ty>=0.0.78", "ruff>=0.16.6", "pytest>=8.0", "typing-extensions>=4.0"]
+
+[tool.ty.rules]
+all = "error"
+
+[tool.ty.analysis]
+strict-equality-semantics = true
+strict-generic-narrowing = true
+
+[tool.ty.environment]
+python-version = "3.11"
+
+[tool.ty.terminal]
+error-on-warning = true
+output-format = "concise"
+
+[tool.ruff]
+target-version = "py311"
+[tool.ruff.lint]
+select = ["ALL"]
+# D203/D213 conflict with D211/D212 (ruff ignores one side itself);
+# COM812 conflicts with `uv format` (formatter owns trailing commas).
+ignore = ["D203", "D213", "COM812"]
+
+[tool.ruff.lint.per-file-ignores]
+# S101 (no asserts) is mutually exclusive with PT009 (require bare asserts in
+# tests) under select ALL; the tools themselves demand one side be disabled.
+"tests/**" = ["S101"]
+
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

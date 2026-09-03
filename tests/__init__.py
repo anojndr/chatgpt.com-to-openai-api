@@ -1,2 +1,2 @@
 # Copyright 2026 chatgpt-to-openai-api contributors.
-"""ChatGPT-to-OpenAI API application package."""
+"""Tests for the chatgpt-to-openai-api proxy."""
