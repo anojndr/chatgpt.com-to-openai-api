@@ -11,7 +11,7 @@ Exposes ChatGPT web accounts as a local **OpenAI-compatible API** (Chat Completi
 Configuration lives in `.env` (never commit real keys):
 
 ```
-PIXELVAULT_API_KEY=pv_live_xxx     # required for generated-image hosting
+FREEIMAGE_API_KEY=xxx              # required for generated-image hosting
 PORT=4035
 # optional:
 # ACCOUNTS_FILE=accounts.txt
@@ -104,10 +104,10 @@ the head!") stream normally.
 
 ### Image output
 
-Generated images are detected in the stream (`sediment://` pointers), downloaded, uploaded to PixelVault, and appended as markdown:
+Generated images are detected in the stream (`sediment://` pointers), downloaded, uploaded to freeimage.host, and appended as markdown:
 
 ```
-![generated image](https://img.pixelvault.dev/proj_*/img_*.png)
+![generated image](https://iili.io/*.png)
 ```
 
 Try: `{"model":"auto","messages":[{"role":"user","content":"generate an image of a cat"}]}`

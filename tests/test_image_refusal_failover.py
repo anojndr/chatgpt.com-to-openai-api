@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import unittest
 from typing import TYPE_CHECKING, TypeAlias
+from unittest.mock import patch
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -25,6 +26,7 @@ from app.accounts import AccountPool
 from app.adapters import HistoryItem, ParsedRequest
 from app.chatgpt import AccountSession
 from app.engine import EngineError, TurnResult, run_turn
+from app.freeimage import FreeimageError
 
 SSEEvent: TypeAlias = dict[str, object]
 
@@ -300,6 +302,134 @@ class TestTemporaryUnavailableFailover(unittest.TestCase):
 
         deltas = asyncio.run(_stream_text(pool))
         assert "quality improved" in "".join(deltas)
+
+
+IMAGE_ONLY_EVENTS = _user_then(
+    [
+        {
+            "message": {
+                "id": "c1",
+                "author": {"role": "assistant"},
+                "content": {"content_type": "code", "parts": ["// generating"]},
+                "metadata": {},
+            },
+        },
+        {
+            "message": {
+                "id": "t1",
+                "author": {"role": "tool"},
+                "content": {
+                    "content_type": "multimodal_text",
+                    "parts": [
+                        {
+                            "content_type": "image_asset_pointer",
+                            "asset_pointer": "sediment://file_test123",
+                        }
+                    ],
+                },
+                "metadata": {},
+            },
+        },
+        {
+            "message": {
+                "id": "a2",
+                "author": {"role": "assistant"},
+                "content": {"content_type": "text", "parts": [""]},
+                "metadata": {"message_type": "next"},
+            },
+        },
+        {"type": "done"},
+    ],
+    conv_id="conv-img",
+)
+
+
+TEXT_AND_IMAGE_EVENTS = _user_then(
+    [
+        {
+            "message": {
+                "id": "a1",
+                "author": {"role": "assistant"},
+                "content": {
+                    "content_type": "text",
+                    "parts": ["Here is the analysis."],
+                },
+                "metadata": {"message_type": "next"},
+            },
+        },
+        {
+            "message": {
+                "id": "t1",
+                "author": {"role": "tool"},
+                "content": {
+                    "content_type": "multimodal_text",
+                    "parts": [
+                        {
+                            "content_type": "image_asset_pointer",
+                            "asset_pointer": "sediment://file_test123",
+                        }
+                    ],
+                },
+                "metadata": {},
+            },
+        },
+        {"type": "done"},
+    ],
+    conv_id="conv-mixed",
+)
+
+
+class TestImageDeliveryFailure(unittest.TestCase):
+    """Regression tests for undeliverable generated images."""
+
+    def test_image_only_turn_with_failed_delivery_errors(self) -> None:
+        """Surface an explicit error instead of an empty success."""
+        pool = AccountPool()
+        pool.register(FakeAccount("img", "img@example.com", IMAGE_ONLY_EVENTS))
+        streamed: list[str] = []
+
+        async def _run() -> None:
+            async for event in run_turn(_make_request(), pool):
+                if event["type"] == "delta":
+                    text = event["text"]
+                    if isinstance(text, str):
+                        streamed.append(text)
+
+        async def _fake_download(_self: AccountSession, _ptr: str) -> tuple[str, bytes]:
+            return ("night.png", b"\x89PNG fake-bytes")
+
+        async def _fake_upload(_name: str, _data: bytes, _mime: str) -> str:
+            msg = "upload failed HTTP 500: internal server error"
+            raise FreeimageError(msg)
+
+        with (
+            patch.object(AccountSession, "download_file_url", _fake_download),
+            patch("app.engine.upload_image", _fake_upload),
+            pytest.raises(EngineError, match=r"image delivery failed"),
+        ):
+            asyncio.run(_run())
+        assert streamed == []
+
+    def test_text_turn_with_failed_delivery_streams_text(self) -> None:
+        """Deliver produced text alone when images cannot be delivered."""
+        pool = AccountPool()
+        pool.register(FakeAccount("mix", "mix@example.com", TEXT_AND_IMAGE_EVENTS))
+
+        async def _fake_download(_self: AccountSession, _ptr: str) -> tuple[str, bytes]:
+            return ("night.png", b"\x89PNG fake-bytes")
+
+        async def _fake_upload(_name: str, _data: bytes, _mime: str) -> str:
+            msg = "upload failed HTTP 500: internal server error"
+            raise FreeimageError(msg)
+
+        with (
+            patch.object(AccountSession, "download_file_url", _fake_download),
+            patch("app.engine.upload_image", _fake_upload),
+        ):
+            _deltas, result = asyncio.run(_stream_turn(pool))
+        assert result is not None
+        assert "Here is the analysis." in "".join(_deltas)
+        assert "Here is the analysis." in result.text
 
 
 if __name__ == "__main__":

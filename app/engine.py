@@ -2,7 +2,7 @@
 """Shared execution path used by both the Chat Completions and Responses APIs.
 
 Streaming-first: emits text deltas as ChatGPT produces them, resolves generated
-images to PixelVault URLs at the end, and records conversation state for
+images to freeimage.host URLs at the end, and records conversation state for
 proper multi-turn continuation.
 """
 
@@ -31,7 +31,7 @@ from .accounts import AccountPool, NoAccountAvailableError
 from .adapters import HistoryItem, ParsedRequest, estimate_tokens, map_model
 from .charts import chart_from_payload, render_chart_png
 from .chatgpt import AccountSession, ChatGPTError, StreamMedia
-from .pixelvault import PixelVaultError, upload_image
+from .freeimage import FreeimageError, upload_image
 from .store import STORE, ConvRef, ResponseRecord, TurnSnapshot, item_hash
 
 log = logging.getLogger("engine")
@@ -275,7 +275,7 @@ _CITE_TOKEN_RE = re.compile(r"turn(\d+)([a-z]+)(\d+)")
 #   "\ue200navlist\ue202<title>\ue202turn0news1...\ue201"   -- UI nav chips
 #   "\ue200image_group\ue202{\"layout\":...}\ue201"          -- image carousel query
 #   "\ue200genui\ue202{\"chart\":...}\ue201"                 -- chart spec: rendered
-#       locally to a PNG and delivered as a PixelVault image link (see run_turn)
+#       locally to a PNG and delivered as a freeimage.host image link (see run_turn)
 #   "\ue200map\ue202{\"query\":...}\ue201"                   -- map card
 # Entity/product cards carry visible content and must not be stripped.
 #   "\ue200entity\ue202["product","Microsoft...", "Model 1067"]\ue201"
@@ -1055,10 +1055,20 @@ def _history_hashes(items: list[HistoryItem], system_text: str) -> list[str]:
 
 
 async def _resolve_images(acct: AccountSession, pointers: list[str]) -> list[str]:
+    """Resolve generated-image pointers to freeimage.host URLs.
+
+    Partial success returns what resolved. Total failure raises instead of
+    returning an empty list: the caller would otherwise record an empty
+    successful turn and the client would see a silent blank reply for an
+    image that ChatGPT actually generated.
+    """
     urls: list[str] = []
+    wanted = 0
+    last_error: Exception | None = None
     for ptr in pointers:
         if not ptr.startswith("sediment://"):
             continue
+        wanted += 1
         try:
             name, data = await acct.download_file_url(ptr)
             mime = (
@@ -1067,8 +1077,14 @@ async def _resolve_images(acct: AccountSession, pointers: list[str]) -> list[str
                 else "image/png"
             )
             urls.append(await upload_image(name, data, mime))
-        except (ChatGPTError, PixelVaultError) as e:
+        except (ChatGPTError, FreeimageError) as e:
+            last_error = e
             log.warning("image resolution failed (%s): %s", ptr, e)
+    if wanted and not urls:
+        detail = f": {last_error}" if last_error is not None else ""
+        raise EngineError(
+            502, f"image delivery failed ({wanted} generated, 0 delivered){detail}"
+        )
     return urls
 
 
@@ -1337,7 +1353,7 @@ async def _chart_link_deltas(specs: list[ChartSpec]) -> list[str]:
             KeyError,
             AttributeError,
             RuntimeError,
-            PixelVaultError,
+            FreeimageError,
         ) as exc:
             log.warning("chart render/upload failed (%s): %s", title[:60], exc)
     return links
@@ -1580,7 +1596,7 @@ async def _collect_media_deltas(
     state: _AttemptState, acct: AccountSession, parsed: ParsedRequest
 ) -> AsyncIterator[dict[str, object]]:
     """Yield chart, image, and source deltas for a flushed attempt."""
-    # genui chart specs -> locally rendered PNG -> PixelVault link.
+    # genui chart specs -> locally rendered PNG -> freeimage.host link.
     # Any failure degrades to the widget simply being stripped.
     chart_links = await _chart_link_deltas(state.chart_specs)
     if chart_links:
@@ -1588,7 +1604,14 @@ async def _collect_media_deltas(
         state.produced = True
         state.text_acc += links
         yield {"type": "delta", "text": links}
-    image_urls = await _resolve_images(acct, state.sediment)
+    try:
+        image_urls = await _resolve_images(acct, state.sediment)
+    except EngineError as exc:
+        if state.text_acc.strip():
+            log.warning("image delivery failed; delivering text alone: %s", exc)
+            image_urls = []
+        else:
+            raise
     if image_urls:
         links = "\n\n" + "\n\n".join(f"![generated image]({url})" for url in image_urls)
         state.produced = True
@@ -1794,7 +1817,7 @@ async def run_turn(
             KeyError,
             AttributeError,
             RuntimeError,
-            PixelVaultError,
+            FreeimageError,
         ) as exc:
             if isinstance(exc, EngineError) and (
                 exc.error_type == "invalid_request_error"

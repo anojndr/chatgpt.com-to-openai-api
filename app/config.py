@@ -24,11 +24,11 @@ def _load_dotenv(path: Path) -> None:
 
 _load_dotenv(ROOT / ".env")
 
-PIXELVAULT_API_KEY: str = os.environ.get("PIXELVAULT_API_KEY", "")
-PIXELVAULT_BASE_URL: str = os.environ.get(
-    "PIXELVAULT_BASE_URL",
-    "https://api.pixelvault.dev",
-)
+FREEIMAGE_API_KEY: str = os.environ.get("FREEIMAGE_API_KEY", "")
+FREEIMAGE_BASE_URL: str = os.environ.get(
+    "FREEIMAGE_BASE_URL",
+    "https://freeimage.host",
+).rstrip("/")
 
 PORT: int = int(os.environ.get("PORT", "4035"))
 # Bind to loopback by default so a fresh checkout never exposes the proxy
