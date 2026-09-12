@@ -18,8 +18,8 @@ from typing_extensions import override
 
 from app.accounts import AccountPool
 from app.adapters import HistoryItem, ParsedRequest
-from app.chatgpt import AccountSession
-from app.engine import TurnResult, run_turn
+from app.chatgpt import AccountSession, ChatGPTError
+from app.engine import EngineError, TurnResult, run_turn
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -31,6 +31,9 @@ REJECTION_MESSAGE = "rejected this prompt"
 INCOMPLETE_MESSAGE = "incomplete response"
 EXPECTED_DIAGRAM_TEXT = "Room-clearing diagram."
 PLUS_EMAIL = "plus@example.com"
+HTTP_BAD_REQUEST_STATUS = 400
+EXPECTED_SINGLE_REQUEST = 1
+EXPECTED_NO_REQUESTS = 0
 
 
 class FakeAccount(AccountSession):
@@ -246,6 +249,82 @@ class TestUpstreamErrorNodes(unittest.TestCase):
 
         with pytest.raises(Exception, match=INCOMPLETE_MESSAGE):
             asyncio.run(run())
+
+
+class TooLargeAccount(AccountSession):
+    """Account stand-in failing fast with backend input_too_large."""
+
+    def __init__(self, identity: str, email: str) -> None:
+        """Create the failing account with the given identity."""
+        super().__init__({
+            "identity": identity,
+            "session": {
+                "accessToken": "",
+                "account": {"planType": "plus"},
+                "user": {"email": email},
+            },
+            "cookies": {},
+        })
+
+    @override
+    async def models(self) -> list[dict[str, str]]:
+        """Return the canned single-model listing.
+
+        Returns:
+            The single-entry model listing with slug ``auto``.
+        """
+        return [{"slug": "auto"}]
+
+    @override
+    async def stream_conversation(
+        self, **_kwargs: object
+    ) -> AsyncIterator[dict[str, object]]:
+        """Raise the backend oversized-message error without streaming.
+
+        Yields:
+            Never yields: raises before the first event.
+
+        Raises:
+            ChatGPTError: Always raised carrying the input_too_large body.
+        """
+        raise ChatGPTError(
+            HTTP_BAD_REQUEST_STATUS,
+            '{"detail":{"message":"The message you submitted was too long, '
+            'please edit it and resubmit.","code":"input_too_large",'
+            '"can_retry":false,"type":"last_user_message"}}',
+        )
+        yield {"type": "done"}
+
+
+class TestInputTooLarge(unittest.TestCase):
+    """Backend input_too_large must surface as 400 without failover."""
+
+    @staticmethod
+    def test_oversized_history_fails_fast_as_400() -> None:
+        """Verify oversized history raises 400 and tries one account only."""
+        pool = AccountPool()
+        first = TooLargeAccount("a", "a@example.com")
+        second = TooLargeAccount("b", "b@example.com")
+        pool.register(first)
+        pool.register(second)
+        parsed = ParsedRequest(
+            system_text="",
+            items=[HistoryItem(role="user", text="q")],
+            model_requested="auto",
+            stream=False,
+        )
+
+        async def run() -> None:
+            """Drain the turn stream."""
+            async for _ in run_turn(parsed, pool):
+                pass
+
+        with pytest.raises(EngineError) as exc_info:
+            asyncio.run(run())
+        assert exc_info.value.status == HTTP_BAD_REQUEST_STATUS
+        assert exc_info.value.error_type == "invalid_request_error"
+        assert first.total_requests == EXPECTED_SINGLE_REQUEST
+        assert second.total_requests == EXPECTED_NO_REQUESTS
 
 
 if __name__ == "__main__":

@@ -15,8 +15,11 @@ tags leaked raw to the client.
 from __future__ import annotations
 
 import asyncio
+import tempfile
 import unittest
+from pathlib import Path
 from typing import TYPE_CHECKING, TypeAlias
+from unittest.mock import patch
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -34,11 +37,13 @@ from app.engine import (
     render_citations,
     run_turn,
 )
+from app.store import ConversationStore
 
 SSEEvent: TypeAlias = dict[str, object]
 
 CONVERSATION_ID = "conv-race"
 EXPECTED_SINGLE_DELIVERY = 1
+EXPECTED_TWO_PROMPTS = 2
 STREAMED_BRANCH_ID = "ta"
 NO_WITHHOLD = -1
 
@@ -336,6 +341,88 @@ class TestJsxCitations(unittest.TestCase):
         assert jsx_cite_cut(raw) == NO_WITHHOLD
         text, _ = render_citations(raw, {}, final=True)
         assert "<Cite" in text
+
+
+class CapturingAccount(AccountSession):
+    """Account stand-in recording prompts and replaying canned events."""
+
+    def __init__(self, identity: str, email: str, events: list[SSEEvent]) -> None:
+        """Create the account with canned events and an empty prompt log."""
+        super().__init__({
+            "identity": identity,
+            "session": {
+                "accessToken": "",
+                "account": {"planType": "plus"},
+                "user": {"email": email},
+            },
+            "cookies": {},
+        })
+        self._events = events
+        self.prompts: list[str] = []
+
+    @override
+    async def models(self) -> list[dict[str, str]]:
+        """Return the canned single-model listing.
+
+        Returns:
+            The single-entry model listing with slug ``auto``.
+        """
+        return [{"slug": "auto"}]
+
+    @override
+    async def stream_conversation(
+        self, *, prompt_text: str, **_kwargs: object
+    ) -> AsyncIterator[SSEEvent]:
+        """Record the prompt and replay the canned SSE events.
+
+        Yields:
+            Each canned server-sent event in order.
+        """
+        self.prompts.append(prompt_text)
+        for event in self._events:
+            yield event
+
+
+class TestBranchContinuation(unittest.TestCase):
+    """Branched retries must continue the shared prefix, not replay all."""
+
+    @staticmethod
+    def test_edited_retry_continues_shared_prefix() -> None:
+        """Verify an edited retry sends only the new message."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationStore(db_path=Path(tmp) / "branch.db")
+            with patch("app.engine.STORE", store):
+                pool = AccountPool()
+                acct = CapturingAccount("a", "a@example.com", RACE_EVENTS)
+                pool.register(acct)
+
+                async def run(items: list[HistoryItem]) -> None:
+                    """Drain one turn for the given history items."""
+                    parsed = ParsedRequest(
+                        system_text="",
+                        items=items,
+                        model_requested="auto",
+                        stream=False,
+                    )
+                    async for _ in run_turn(parsed, pool):
+                        pass
+
+                first = [
+                    HistoryItem(role="user", text="u1"),
+                    HistoryItem(role="assistant", text="a1"),
+                    HistoryItem(role="user", text="u2 suffix"),
+                ]
+                asyncio.run(run(first))
+                branched = [
+                    HistoryItem(role="user", text="u1"),
+                    HistoryItem(role="assistant", text="a1"),
+                    HistoryItem(role="user", text="u2"),
+                    HistoryItem(role="assistant", text="a2"),
+                    HistoryItem(role="user", text="u3"),
+                ]
+                asyncio.run(run(branched))
+                assert len(acct.prompts) == EXPECTED_TWO_PROMPTS
+                assert acct.prompts[1] == "u3"
 
 
 if __name__ == "__main__":

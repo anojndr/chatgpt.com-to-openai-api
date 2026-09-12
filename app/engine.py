@@ -46,7 +46,9 @@ MIN_SELECTION_FIELDS = 2
 ASCII_CONTROL_LIMIT = 0x20
 ASCII_DELETE_CODE = 0x7F
 JSX_CITE_SHORT_MAX = 120
+HTTP_BAD_REQUEST = 400
 HTTP_RATE_LIMITED = 429
+INPUT_TOO_LARGE_MARKER = "input_too_large"
 
 
 @dataclass
@@ -1460,6 +1462,16 @@ def _live_slugs(models: object) -> set[str]:
     return slugs
 
 
+def _is_input_too_large(text: str) -> bool:
+    """Whether a backend error body reports an oversized single message.
+
+    Returns:
+        True when the body carries the backend ``input_too_large`` code.
+
+    """
+    return INPUT_TOO_LARGE_MARKER in text
+
+
 def _failure_for(
     exc: BaseException, acct: AccountSession, pool: AccountPool
 ) -> EngineError:
@@ -1477,6 +1489,13 @@ def _failure_for(
         pool.report_status(acct, exc.status)
         if exc.status == HTTP_RATE_LIMITED:
             return EngineError(HTTP_RATE_LIMITED, exc.message, "rate_limit_error")
+        if _is_input_too_large(exc.message):
+            detail = exc.message[:300]
+            message = (
+                f"history too long for ChatGPT ({detail}). "
+                "Start a new conversation or shorten the history"
+            )
+            return EngineError(HTTP_BAD_REQUEST, message, "invalid_request_error")
         return EngineError(502, exc.message, "server_error")
     if isinstance(exc, EngineError):
         return exc
@@ -1511,7 +1530,14 @@ async def _prepare_attempt(
     ctx_sys, ctx_items = _fallback_context(parsed, hashes, previous_response_id)
     hist_len = len(ctx_items) - len(parsed.items)
     pointers, attachments = await _upload_inputs(acct, ctx_items, strict_from=hist_len)
-    return _replay_prompt(ctx_sys, ctx_items), pointers, attachments
+    prompt = _replay_prompt(ctx_sys, ctx_items)
+    log.info(
+        "replay prompt: items=%d chars=%d on %s",
+        len(ctx_items),
+        len(prompt),
+        acct.email,
+    )
+    return prompt, pointers, attachments
 
 
 def _is_rival_branch(text_acc: str, parts: list[object]) -> bool:
@@ -2014,15 +2040,6 @@ def _record_done(
 
     """
     parsed = turn.parsed
-    new_ref = ConvRef(
-        acct.identity,
-        state.cid,
-        state.parent,
-        len(parsed.items),
-        time.time(),
-    )
-    if turn.hashes:
-        STORE.record_turn([turn.hashes[-1]], new_ref)
     # Record CUMULATIVE context: stateful clients send only new items per
     # call, so a delta-only snapshot would lose earlier turns on a later
     # failover (chained via previous_response_id).
@@ -2031,6 +2048,19 @@ def _record_done(
         prev_snap = STORE.get_snapshot(turn.previous_response_id)
         if prev_snap is not None:
             snap_sys, snap_items = _chain_context(prev_snap, parsed, turn.hashes)
+    new_ref = ConvRef(
+        acct.identity,
+        state.cid,
+        state.parent,
+        len(snap_items),
+        time.time(),
+    )
+    if snap_items:
+        # Store every prefix hash, not just the tail: any edit or retry that
+        # branches off an earlier turn must still find its longest common
+        # prefix and continue that live conversation with a short prompt
+        # instead of replaying the full history as one oversized message.
+        STORE.record_turn(_history_hashes(snap_items, snap_sys), new_ref)
     STORE.put_response(
         ResponseRecord(
             turn.rid,
@@ -2213,6 +2243,10 @@ async def run_turn(
             ):
                 raise EngineError(exc.status, exc.message, exc.error_type) from exc
             failure = _failure_for(exc, acct, pool)
+            if failure.error_type == "invalid_request_error":
+                # Oversized history (backend can_retry=false) cannot succeed on
+                # another account with the same prompt: fail fast as 400.
+                raise failure from exc
             if state.produced:
                 salvaged = _salvage_text(
                     state.text_acc,
