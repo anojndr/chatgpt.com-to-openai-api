@@ -22,7 +22,15 @@ class FreeimageError(Exception):
 
 
 async def upload_image(name: str, data: bytes, mime: str) -> str:
-    """Upload image bytes, returning the public URL."""
+    """Upload image bytes, returning the public URL.
+
+    Returns:
+        The public URL of the uploaded image.
+
+    Raises:
+        FreeimageError: If the API key is missing or the upload fails.
+
+    """
     if not config.FREEIMAGE_API_KEY:
         msg = "FREEIMAGE_API_KEY not configured"
         raise FreeimageError(msg)
@@ -40,7 +48,7 @@ async def upload_image(name: str, data: bytes, mime: str) -> str:
             },
             timeout=120,
         )
-        if response.status_code not in (200, 201):
+        if response.status_code not in {200, 201}:
             msg = f"upload failed HTTP {response.status_code}: {response.text[:200]}"
             raise FreeimageError(msg)
         payload = response.json()

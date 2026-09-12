@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 def _load_dotenv(path: Path) -> None:
     if not path.exists():
         return
-    for raw_line in path.read_text().splitlines():
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -42,7 +42,7 @@ API_KEY: str = os.environ.get("API_KEY", "")  # optional bearer gate for THIS pr
 INCLUDE_SOURCES: bool = os.environ.get(
     "CHATGPT_INCLUDE_SOURCES",
     os.environ.get("INCLUDE_SOURCES", "0"),
-).strip().lower() in ("1", "true", "yes", "on")
+).strip().lower() in {"1", "true", "yes", "on"}
 
 DEFAULT_MODEL: str = os.environ.get("DEFAULT_MODEL", "auto")
 COOLDOWN_FREE_SECONDS: int = int(os.environ.get("COOLDOWN_FREE_SECONDS", "900"))
@@ -78,6 +78,6 @@ KEEPALIVE_MIN_IMPROVEMENT: float = float(
 USER_AGENT: str = os.environ.get(
     "UA",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+    "(KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
 )
 IMPERSONATE: str = os.environ.get("TLS_IMPERSONATE", "chrome")

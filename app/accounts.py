@@ -58,7 +58,12 @@ _BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
 
 
 def _track_task(task: asyncio.Task[None]) -> asyncio.Task[None]:
-    """Retain a fire-and-forget task until it finishes."""
+    """Retain a fire-and-forget task until it finishes.
+
+    Returns:
+        The same task, retained in the module-level set until done.
+
+    """
     _BACKGROUND_TASKS.add(task)
     task.add_done_callback(_BACKGROUND_TASKS.discard)
     return task
@@ -79,6 +84,10 @@ def _exclusive_lock(path: Path) -> Iterator[None]:
     Single non-blocking attempt: on contention raise TimeoutError immediately
     so the async event loop never sleeps on a retry — the 2s watch cadence
     retries with state_dirty preserved.
+
+    Raises:
+        TimeoutError: If the lock file is already held by another process.
+
     """
     lock_path = path.with_name(path.name + ".lock")
     with lock_path.open("w") as lf:
@@ -106,11 +115,21 @@ class AccountPool:
         self._accounts[account.identity] = account
 
     def get_account(self, identity: str) -> AccountSession | None:
-        """Return the pooled session for an identity, if present."""
+        """Return the pooled session for an identity, if present.
+
+        Returns:
+            The pooled session, or None when the identity is unknown.
+
+        """
         return self._accounts.get(identity)
 
     def __len__(self) -> int:
-        """Return the number of pooled accounts."""
+        """Return the number of pooled accounts.
+
+        Returns:
+            The number of sessions currently held in the pool.
+
+        """
         return len(self._accounts)
 
     # ---------- lifecycle ----------
@@ -301,34 +320,47 @@ class AccountPool:
         if not dirty:
             return
         path = config.ACCOUNTS_FILE
+        tmp = path.with_name(path.name + ".tmp")
         try:
-            with _exclusive_lock(path):
-                text = path.read_text()
-                new_text, written, fresher = self._replace_blocks(text, dirty)
-                if not written:
-                    for a in dirty.values():
-                        a.state_dirty = a.identity in fresher
-                    if fresher:
-                        self.load()  # adopt the raced edit now
-                    return
-                tmp = path.with_name(path.name + ".tmp")
-                tmp.write_text(new_text)
-                tmp.replace(path)
+            written, fresher = self._locked_rewrite(path, tmp, dirty)
         except (OSError, TimeoutError) as e:
             log.warning("accounts.txt persist failed: %s", e)
             return
-        with contextlib.suppress(FileNotFoundError):
-            self._mtime = path.stat().st_mtime
         for a in dirty.values():
             a.state_dirty = a.identity in fresher
         if fresher:
             self.load()  # adopt the raced edit now
+        if not written:
+            return
+        with contextlib.suppress(FileNotFoundError):
+            self._mtime = path.stat().st_mtime
         written_accts = [a for a in dirty.values() if a.identity not in fresher]
         if written_accts:
             log.info(
                 "persisted refreshed auth state for %s",
                 ", ".join(a.email or a.identity for a in written_accts),
             )
+
+    def _locked_rewrite(
+        self,
+        path: Path,
+        tmp: Path,
+        dirty: dict[str, AccountSession],
+    ) -> tuple[list[str], set[str]]:
+        """Rewrite dirty blocks under the lock and return written/fresher ids.
+
+        Returns:
+            A (written, fresher) pair of replaced identities and identities
+                left untouched because the on-disk block is newer.
+
+        """
+        with _exclusive_lock(path):
+            text = path.read_text(encoding="utf-8")
+            new_text, written, fresher = self._replace_blocks(text, dirty)
+            if written:
+                tmp.write_text(new_text, encoding="utf-8")
+                tmp.replace(path)
+        return written, fresher
 
     @staticmethod
     def _replace_blocks(
@@ -339,6 +371,12 @@ class AccountPool:
 
         Return the new text, the replaced identities, and identities left
         untouched because the on-disk block carries a strictly newer JWT.
+
+        Returns:
+            A (new text, written, fresher) triple of the rebuilt file text,
+                the replaced identities, and identities skipped because the
+                on-disk block carries a strictly newer JWT.
+
         """
         written: list[str] = []
         fresher: set[str] = set()
@@ -357,8 +395,7 @@ class AccountPool:
                 if disk_exp and disk_exp > acct.jwt_exp:
                     fresher.add(ident)  # raced edit wins; load() adopts below
                     continue
-            out.append(text[pos : m.start()])
-            out.append(_render_block_body(acct))
+            out.extend((text[pos : m.start()], render_block_body(acct)))
             pos = m.end()
             written.append(ident)
         if not written:
@@ -368,7 +405,12 @@ class AccountPool:
 
     # ---------- selection ----------
     def available(self) -> list[AccountSession]:
-        """Return live accounts eligible for new requests."""
+        """Return live accounts eligible for new requests.
+
+        Returns:
+            The live, off-cooldown sessions eligible for new requests.
+
+        """
         now = time.time()
         return [
             a for a in self._accounts.values() if not a.dead and a.cooldown_until <= now
@@ -392,6 +434,13 @@ class AccountPool:
 
         Used by the engine's failover loop to walk every available account
         exactly once before giving up.
+
+        Returns:
+            The acquired session with its in-flight slot already held.
+
+        Raises:
+            NoAccountAvailableError: If no eligible account can serve a request.
+
         """
         if preferred_identity and preferred_identity not in exclude:
             a = self._find(preferred_identity)
@@ -413,11 +462,13 @@ class AccountPool:
         chosen.last_used = time.time()
         return chosen
 
-    def release(self, acct: AccountSession) -> None:
+    @staticmethod
+    def release(acct: AccountSession) -> None:
         """Release one in-flight slot on an account."""
         acct.inflight = max(0, acct.inflight - 1)
 
-    def report_status(self, acct: AccountSession, status: int) -> None:
+    @staticmethod
+    def report_status(acct: AccountSession, status: int) -> None:
         """Update account health after a conversation attempt."""
         now = time.time()
         if status == HTTP_TOO_MANY_REQUESTS:
@@ -438,7 +489,12 @@ class AccountPool:
             acct.cooldown_until = now + FORBIDDEN_COOLDOWN_S
 
     def snapshot(self) -> list[dict[str, str | int | bool | None]]:
-        """Return a JSON-able health summary of every pooled account."""
+        """Return a JSON-able health summary of every pooled account.
+
+        Returns:
+            One health dict per pooled account, in pool order.
+
+        """
         now = time.time()
         return [
             {
@@ -457,11 +513,15 @@ class AccountPool:
         ]
 
 
-def _render_block_body(acct: AccountSession) -> str:
+def render_block_body(acct: AccountSession) -> str:
     """Render the '<<<' ... '>>>' body for one account.
 
     Mirrors the format parse_accounts_text expects (netscape cookie rows
     plus session JSON).
+
+    Returns:
+        The serialized block body for the account.
+
     """
     live = dict(acct.session_json)
     live["accessToken"] = acct.access_token

@@ -37,7 +37,12 @@ MAX_RESPONSE_ROWS = 5000
 
 
 def item_hash(prev: str, role: str, canon: str) -> str:
-    """Hash one history item into the rolling conversation chain."""
+    """Hash one history item into the rolling conversation chain.
+
+    Returns:
+        The 32-character hex hash for the history item.
+
+    """
     h = hashlib.sha256()
     h.update(prev.encode())
     h.update(f"|{role}|".encode())
@@ -46,7 +51,12 @@ def item_hash(prev: str, role: str, canon: str) -> str:
 
 
 def canon_content(text: str, extra: Iterable[object] | None = None) -> str:
-    """Build canonical text for one message plus attachment descriptors."""
+    """Build canonical text for one message plus attachment descriptors.
+
+    Returns:
+        Canonical text with attachment descriptors appended when present.
+
+    """
     if extra:
         return text + "\x00" + repr(sorted(map(str, extra)))
     return text
@@ -77,14 +87,24 @@ class TurnSnapshot:
     items: list[HistoryItem]
 
     def payload_bytes(self) -> int:
-        """Sum the binary payload held by this snapshot."""
+        """Sum the binary payload held by this snapshot.
+
+        Returns:
+            Total bytes of image and file payloads in the snapshot.
+
+        """
         return sum(len(im.data) for it in self.items for im in it.images) + sum(
             len(f.data) for it in self.items for f in it.files
         )
 
 
 def _trim_snapshot(snap: TurnSnapshot, cap_bytes: int) -> TurnSnapshot:
-    """Drop largest binaries until under cap. Text is always kept whole."""
+    """Drop largest binaries until under cap. Text is always kept whole.
+
+    Returns:
+        The original snapshot when under cap, else a trimmed copy.
+
+    """
     if snap.payload_bytes() <= cap_bytes:
         return snap
     sized: list[tuple[int, int, str, int]] = []  # (size, item_idx, kind, part_idx)
@@ -124,7 +144,12 @@ class ResponseRecord:
 
 
 def _serialize_snapshot(snap: TurnSnapshot) -> bytes:
-    """Encode a turn snapshot as UTF-8 JSON bytes."""
+    """Encode a turn snapshot as UTF-8 JSON bytes.
+
+    Returns:
+        The snapshot encoded as UTF-8 JSON bytes.
+
+    """
     data = {
         "system_text": snap.system_text,
         "items": [
@@ -155,7 +180,12 @@ def _serialize_snapshot(snap: TurnSnapshot) -> bytes:
 
 
 def _decode_binary(entry: dict[str, object]) -> bytes:
-    """Decode one snapshot binary entry (base64, falling back to hex)."""
+    """Decode one snapshot binary entry (base64, falling back to hex).
+
+    Returns:
+        The decoded binary bytes, or empty bytes when absent.
+
+    """
     if "data_b64" in entry:
         raw_b64 = entry["data_b64"]
         text_b64 = raw_b64 if isinstance(raw_b64, str) else ""
@@ -171,11 +201,16 @@ def _decode_binary(entry: dict[str, object]) -> bytes:
 
 
 def _deserialize_snapshot(raw: bytes | str) -> TurnSnapshot | None:
-    """Rebuild a turn snapshot from stored JSON bytes, or None if corrupt."""
+    """Rebuild a turn snapshot from stored JSON bytes, or None if corrupt.
+
+    Returns:
+        The rebuilt turn snapshot, or None when the payload is corrupt.
+
+    """
+    items: list[HistoryItem] = []
     try:
         text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
         data = json.loads(text)
-        items = []
         for it in data.get("items", []):
             images = [
                 ImageInput(im["filename"], im["mime"], _decode_binary(im))
@@ -244,6 +279,10 @@ class ConversationStore:
 
         Public seam for tests and maintenance scripts that need raw
         SQL access; delegates identically to the internal transaction.
+
+        Yields:
+            The transactional SQLite connection.
+
         """
         with self._transaction() as conn:
             yield conn
@@ -283,7 +322,12 @@ class ConversationStore:
 
     # ---------- chat-completions style ----------
     def find(self, hashes: list[str]) -> tuple[int, ConvRef] | None:
-        """Return the longest prefix match as (matched_len, ref)."""
+        """Return the longest prefix match as (matched_len, ref).
+
+        Returns:
+            The matched length and conversation ref, or None when no match.
+
+        """
         if not hashes:
             return None
         with self._lock:
@@ -420,7 +464,12 @@ class ConversationStore:
                 conn.execute("DELETE FROM responses WHERE created < ?", (cutoff,))
 
     def get_response(self, response_id: str) -> ResponseRecord | None:
-        """Fetch one response record by id, or None when unknown."""
+        """Fetch one response record by id, or None when unknown.
+
+        Returns:
+            The stored response record, or None when unknown.
+
+        """
         with self._lock:
             conn = self._get_conn()
             cur = conn.execute(
@@ -444,7 +493,12 @@ class ConversationStore:
             )
 
     def get_snapshot(self, response_id: str) -> TurnSnapshot | None:
-        """Fetch one response snapshot by id, or None when missing."""
+        """Fetch one response snapshot by id, or None when missing.
+
+        Returns:
+            The stored turn snapshot, or None when missing.
+
+        """
         with self._lock:
             conn = self._get_conn()
             cur = conn.execute(

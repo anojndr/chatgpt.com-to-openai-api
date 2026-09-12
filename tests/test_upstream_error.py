@@ -56,14 +56,24 @@ class FakeAccount(AccountSession):
 
     @override
     async def models(self) -> list[dict[str, str]]:
-        """Return the canned model list."""
+        """Return the canned model list.
+
+        Returns:
+            The single-entry model list with slug ``auto``.
+
+        """
         return [{"slug": "auto"}]
 
     @override
     async def stream_conversation(
         self, **_kwargs: object
     ) -> AsyncIterator[dict[str, object]]:
-        """Replay canned SSE events, ignoring request details."""
+        """Replay canned SSE events, ignoring request details.
+
+        Yields:
+            Each canned SSE event in order.
+
+        """
         for event in self._events:
             yield event
 
@@ -71,7 +81,12 @@ class FakeAccount(AccountSession):
 def _user_then(
     events_tail: list[dict[str, object]], conv_id: str = "conv-x"
 ) -> list[dict[str, object]]:
-    """Prepend a user message event to canned assistant events."""
+    """Prepend a user message event to canned assistant events.
+
+    Returns:
+        The user message event followed by the given assistant events.
+
+    """
     head: list[dict[str, object]] = [
         {
             "message": {
@@ -138,7 +153,12 @@ class TestUpstreamErrorNodes(unittest.TestCase):
 
     @staticmethod
     def _parsed() -> ParsedRequest:
-        """Build the minimal user request shared by all tests."""
+        """Build the minimal user request shared by all tests.
+
+        Returns:
+            A single-turn user request for ``auto`` with streaming disabled.
+
+        """
         return ParsedRequest(
             system_text="",
             items=[HistoryItem(role="user", text="q")],
@@ -202,15 +222,13 @@ class TestUpstreamErrorNodes(unittest.TestCase):
 
         async def run() -> None:
             """Collect streamed delta texts."""
-            deltas.extend(
-                [
-                    text
-                    async for event in run_turn(self._parsed(), pool)
-                    if event["type"] == DELTA_EVENT_TYPE
-                    for text in [event["text"]]
-                    if isinstance(text, str)
-                ]
-            )
+            deltas.extend([
+                text
+                async for event in run_turn(self._parsed(), pool)
+                if event["type"] == DELTA_EVENT_TYPE
+                for text in [event["text"]]
+                if isinstance(text, str)
+            ])
 
         asyncio.run(run())
         assert "".join(deltas) == EXPECTED_DIAGRAM_TEXT

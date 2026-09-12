@@ -34,7 +34,7 @@ from .chatgpt import ChatGPTError
 from .engine import EngineError, TurnResult, collect, run_turn
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Iterator
 
 logging.basicConfig(
     level=logging.INFO,
@@ -68,7 +68,12 @@ app = FastAPI(title="chatgpt-to-openai-api", version="1.0.0", lifespan=lifespan)
 
 
 def auth_ok(request: Request) -> bool:
-    """Check whether the request carries a valid API key."""
+    """Check whether the request carries a valid API key.
+
+    Returns:
+        True when the request is authorized, else False.
+
+    """
     if not config.API_KEY:
         return True
     auth = request.headers.get("authorization", "")
@@ -82,7 +87,12 @@ def oai_error(
     err_type: str = "invalid_request_error",
     code: str | None = None,
 ) -> JSONResponse:
-    """Build an OpenAI-style JSON error response."""
+    """Build an OpenAI-style JSON error response.
+
+    Returns:
+        The JSON error response with the given status and message.
+
+    """
     return JSONResponse(
         status_code=status,
         content={
@@ -97,14 +107,27 @@ def oai_error(
 
 
 @app.exception_handler(EngineError)
-async def engine_error_handler(_request: Request, exc: EngineError) -> JSONResponse:
-    """Translate an EngineError into an OpenAI-style error response."""
+def engine_error_handler(_request: Request, exc: EngineError) -> JSONResponse:
+    """Translate an EngineError into an OpenAI-style error response.
+
+    Returns:
+        The OpenAI-style JSON error response for the failure.
+
+    """
     status = exc.status if exc.status >= _HTTP_BAD_REQUEST else _HTTP_BAD_GATEWAY
     return oai_error(status, exc.message, exc.error_type)
 
 
 async def _body(request: Request) -> dict[str, object]:
-    """Parse the request body as a JSON object."""
+    """Parse the request body as a JSON object.
+
+    Returns:
+        The request body as a string-keyed dict.
+
+    Raises:
+        EngineError: If the body is not valid JSON or not a JSON object.
+
+    """
     try:
         raw = await request.body()
         parsed = json.loads(raw)
@@ -122,7 +145,12 @@ async def _body(request: Request) -> dict[str, object]:
 @app.get("/v1/models", response_model=None)
 @app.get("/models", response_model=None)
 async def list_models(request: Request) -> JSONResponse | dict[str, object]:
-    """Return the live model list, falling back to a static entry."""
+    """Return the live model list, falling back to a static entry.
+
+    Returns:
+        The live model list payload, or a static fallback entry.
+
+    """
     if not auth_ok(request):
         return oai_error(401, "invalid api key", "authentication_error")
     fallback: dict[str, object] = {
@@ -156,118 +184,177 @@ async def list_models(request: Request) -> JSONResponse | dict[str, object]:
 
 
 def _sse(obj: dict[str, object]) -> str:
-    """Encode a payload as a server-sent event line."""
+    """Encode a payload as a server-sent event line.
+
+    Returns:
+        The payload encoded as a server-sent event line.
+
+    """
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+
+async def _turn_events(
+    parsed: ParsedRequest,
+    *,
+    previous_response_id: str | None = None,
+    preferred: str | None = None,
+) -> AsyncIterator[dict[str, object]]:
+    """Yield turn events, converting engine failures into error events.
+
+    Yields:
+        Turn event dicts, with an error event carrying the EngineError.
+
+    """
+    try:
+        async for ev in run_turn(
+            parsed,
+            POOL,
+            previous_response_id=previous_response_id,
+            response_id_prefix="resp_",
+            preferred_email=preferred,
+        ):
+            yield ev
+    except EngineError as exc:
+        yield {"type": "error", "error": exc}
+
+
+def _chat_done_chunks(
+    *,
+    cid: str,
+    created: int,
+    model: str,
+    res: object,
+    include_usage: bool,
+) -> Iterator[str]:
+    """Yield closing chunks for a completed turn.
+
+    Yields:
+        SSE-encoded stop and usage chunks ending with a done sentinel.
+
+    """
+    if not isinstance(res, TurnResult):
+        return
+    usage_block = {
+        "prompt_tokens": res.prompt_tokens,
+        "completion_tokens": res.completion_tokens,
+        "total_tokens": res.prompt_tokens + res.completion_tokens,
+    }
+    if include_usage:
+        yield _sse(
+            {
+                "id": cid,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "system_fingerprint": None,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "logprobs": None,
+                        "finish_reason": "stop",
+                    },
+                ],
+            },
+        )
+        yield _sse(
+            {
+                "id": cid,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "system_fingerprint": None,
+                "choices": [],
+                "usage": usage_block,
+            },
+        )
+    else:
+        yield _sse(
+            {
+                "id": cid,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "system_fingerprint": None,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "logprobs": None,
+                        "finish_reason": "stop",
+                    },
+                ],
+            },
+        )
+    yield "data: [DONE]\n\n"
 
 
 async def chat_stream(
     parsed: ParsedRequest, *, include_usage: bool, preferred: str | None = None
 ) -> AsyncIterator[str]:
-    """Stream chat completion chunks for a parsed request."""
+    """Stream chat completion chunks for a parsed request.
+
+    Yields:
+        SSE-encoded chat completion chunks ending with a done sentinel.
+
+    """
     cid = "chatcmpl-" + uuid.uuid4().hex
     created = int(time.time())
     model = parsed.model_requested or "auto"
     first = True
-    try:
-        async for ev in run_turn(parsed, POOL, preferred_email=preferred):
-            if ev["type"] == "model":
-                model_name = ev["model"]  # resolved live slug, stamped on chunks
-                if isinstance(model_name, str):
-                    model = model_name
-            elif ev["type"] == "delta":
-                t = ev["text"]
-                if not isinstance(t, str):
-                    continue
-                # first chunk carries role + any initial content (never drop text)
-                delta = {"role": "assistant", "content": t} if first else {"content": t}
-                chunk: dict[str, object] = {
-                    "id": cid,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "system_fingerprint": None,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": delta,
-                            "logprobs": None,
-                            "finish_reason": None,
+    async for ev in _turn_events(parsed, preferred=preferred):
+        if ev["type"] == "model":
+            model_name = ev["model"]  # resolved live slug, stamped on chunks
+            if isinstance(model_name, str):
+                model = model_name
+        elif ev["type"] == "delta":
+            t = ev["text"]
+            if not isinstance(t, str):
+                continue
+            # first chunk carries role + any initial content (never drop text)
+            delta = {"role": "assistant", "content": t} if first else {"content": t}
+            chunk: dict[str, object] = {
+                "id": cid,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "system_fingerprint": None,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": delta,
+                        "logprobs": None,
+                        "finish_reason": None,
+                    },
+                ],
+            }
+            first = False
+            yield _sse(chunk)
+        elif ev["type"] == "done":
+            for chunk in _chat_done_chunks(
+                cid=cid,
+                created=created,
+                model=model,
+                res=ev["result"],
+                include_usage=include_usage,
+            ):
+                yield chunk
+        elif ev["type"] == "error":
+            # headers are already sent; deliver the failure in-band so clients
+            # see a well-formed error instead of a truncated stream
+            err = ev["error"]
+            if isinstance(err, EngineError):
+                yield _sse(
+                    {
+                        "error": {
+                            "message": err.message,
+                            "type": err.error_type,
+                            "param": None,
+                            "code": str(err.status),
                         },
-                    ],
-                }
-                first = False
-                yield _sse(chunk)
-            elif ev["type"] == "done":
-                res = ev["result"]
-                if not isinstance(res, TurnResult):
-                    continue
-                usage_block = {
-                    "prompt_tokens": res.prompt_tokens,
-                    "completion_tokens": res.completion_tokens,
-                    "total_tokens": res.prompt_tokens + res.completion_tokens,
-                }
-                if include_usage:
-                    yield _sse(
-                        {
-                            "id": cid,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "system_fingerprint": None,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {},
-                                    "logprobs": None,
-                                    "finish_reason": "stop",
-                                },
-                            ],
-                        },
-                    )
-                    yield _sse(
-                        {
-                            "id": cid,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "system_fingerprint": None,
-                            "choices": [],
-                            "usage": usage_block,
-                        },
-                    )
-                else:
-                    yield _sse(
-                        {
-                            "id": cid,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "system_fingerprint": None,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {},
-                                    "logprobs": None,
-                                    "finish_reason": "stop",
-                                },
-                            ],
-                        },
-                    )
-                yield "data: [DONE]\n\n"
-    except EngineError as e:
-        # headers are already sent; deliver the failure in-band so clients see a
-        # well-formed error instead of a truncated stream
-        yield _sse(
-            {
-                "error": {
-                    "message": e.message,
-                    "type": e.error_type,
-                    "param": None,
-                    "code": str(e.status),
-                },
-            },
-        )
-        yield "data: [DONE]\n\n"
+                    },
+                )
+            yield "data: [DONE]\n\n"
 
 
 @app.post("/v1/chat/completions", response_model=None)
@@ -275,7 +362,12 @@ async def chat_stream(
 async def chat_completions(
     request: Request,
 ) -> JSONResponse | StreamingResponse | dict[str, object]:
-    """Handle a chat completion request, streaming or buffered."""
+    """Handle a chat completion request, streaming or buffered.
+
+    Returns:
+        The streaming response when requested, else the buffered completion.
+
+    """
     if not auth_ok(request):
         return oai_error(401, "invalid api key", "authentication_error")
     body = await _body(request)
@@ -343,7 +435,12 @@ def _response_resource(
     prev: str | None,
     content: _ResponseContent,
 ) -> dict[str, object]:
-    """Build a Responses API resource envelope."""
+    """Build a Responses API resource envelope.
+
+    Returns:
+        The Responses API resource envelope dict.
+
+    """
     return {
         "id": rid,
         "object": "response",
@@ -379,7 +476,12 @@ def _failed_response_resource(
     message: str,
     error_type: str,
 ) -> dict[str, object]:
-    """Build a failed Responses API resource envelope."""
+    """Build a failed Responses API resource envelope.
+
+    Returns:
+        The failed resource envelope with error details attached.
+
+    """
     failed = _ResponseContent(status="failed", output_items=[], usage=None)
     resource = _response_resource(rid, model, int(time.time()), prev, failed)
     return resource | {"error": {"message": message, "type": error_type}}
@@ -392,7 +494,12 @@ def _msg_item(
     *,
     with_content: bool = True,
 ) -> dict[str, object]:
-    """Build a Responses message output item."""
+    """Build a Responses message output item.
+
+    Returns:
+        The Responses message output item dict.
+
+    """
     item: dict[str, object] = {
         "id": msg_id,
         "type": "message",
@@ -409,7 +516,12 @@ def _msg_item(
 async def responses_stream(
     parsed: ParsedRequest, prev: str | None, preferred: str | None = None
 ) -> AsyncIterator[str]:
-    """Stream Responses API events for a parsed request."""
+    """Stream Responses API events for a parsed request.
+
+    Yields:
+        SSE-encoded Responses API events ending with a done sentinel.
+
+    """
     seq = 0
     rid = "resp_" + uuid.uuid4().hex
     msg_id = "msg_" + uuid.uuid4().hex
@@ -446,41 +558,36 @@ async def responses_stream(
 
     text_acc = ""
     result: TurnResult | None = None
-    try:
-        async for e in run_turn(
-            parsed,
-            POOL,
-            previous_response_id=prev,
-            response_id_prefix="resp_",
-            preferred_email=preferred,
-        ):
-            if e["type"] == "delta":
-                text = e["text"]
-                if not isinstance(text, str):
-                    continue
-                text_acc += text
+    async for e in _turn_events(parsed, previous_response_id=prev, preferred=preferred):
+        if e["type"] == "delta":
+            text = e["text"]
+            if not isinstance(text, str):
+                continue
+            text_acc += text
+            yield ev(
+                "response.output_text.delta",
+                item_id=msg_id,
+                output_index=0,
+                content_index=0,
+                delta=text,
+                logprobs=[],
+                obfuscation=None,
+            )
+        elif e["type"] == "done":
+            done_result = e["result"]
+            if isinstance(done_result, TurnResult):
+                result = done_result
+        elif e["type"] == "error":
+            err = e["error"]
+            if isinstance(err, EngineError):
                 yield ev(
-                    "response.output_text.delta",
-                    item_id=msg_id,
-                    output_index=0,
-                    content_index=0,
-                    delta=text,
-                    logprobs=[],
-                    obfuscation=None,
+                    "response.failed",
+                    response=_failed_response_resource(
+                        rid, default_model, prev, err.message, err.error_type
+                    ),
                 )
-            elif e["type"] == "done":
-                done_result = e["result"]
-                if isinstance(done_result, TurnResult):
-                    result = done_result
-    except EngineError as e:
-        yield ev(
-            "response.failed",
-            response=_failed_response_resource(
-                rid, default_model, prev, e.message, e.error_type
-            ),
-        )
-        yield "data: [DONE]\n\n"
-        return
+            yield "data: [DONE]\n\n"
+            return
 
     if result is None:
         yield ev(
@@ -536,7 +643,12 @@ async def responses_stream(
 async def responses_api(
     request: Request,
 ) -> JSONResponse | StreamingResponse | dict[str, object]:
-    """Handle a Responses API request, streaming or buffered."""
+    """Handle a Responses API request, streaming or buffered.
+
+    Returns:
+        The streaming response when requested, else the buffered resource.
+
+    """
     if not auth_ok(request):
         return oai_error(401, "invalid api key", "authentication_error")
     body = await _body(request)
@@ -580,14 +692,24 @@ async def responses_api(
 
 @app.get("/healthz", response_model=None)
 async def healthz() -> dict[str, object]:
-    """Report pool health."""
+    """Report pool health.
+
+    Returns:
+        The pool health status and available account count.
+
+    """
     avail = len(POOL.available())
     return {"status": "ok" if avail else "degraded", "accounts_available": avail}
 
 
 @app.get("/v1/accounts", response_model=None)
 async def accounts_snapshot(request: Request) -> JSONResponse | dict[str, object]:
-    """Return a snapshot of pooled accounts, masking emails when open."""
+    """Return a snapshot of pooled accounts, masking emails when open.
+
+    Returns:
+        The account snapshot payload.
+
+    """
     if not auth_ok(request):
         return oai_error(401, "invalid api key", "authentication_error")
     snap = POOL.snapshot()

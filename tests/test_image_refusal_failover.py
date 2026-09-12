@@ -44,33 +44,46 @@ class FakeAccount(AccountSession):
         plan: str = "free",
     ) -> None:
         """Create a replay account serving the given canned events."""
-        super().__init__(
-            {
-                "identity": identity,
-                "session": {
-                    "accessToken": "",
-                    "account": {"planType": plan},
-                    "user": {"email": email},
-                },
-                "cookies": {},
-            }
-        )
+        super().__init__({
+            "identity": identity,
+            "session": {
+                "accessToken": "",
+                "account": {"planType": plan},
+                "user": {"email": email},
+            },
+            "cookies": {},
+        })
         self._events = events
 
     @override
     async def models(self) -> list[dict[str, str]]:
-        """Return the canned single-model listing."""
+        """Return the canned single-model listing.
+
+        Returns:
+            The single-entry model listing with slug ``auto``.
+
+        """
         return [{"slug": "auto"}]
 
     @override
     async def stream_conversation(self, **_kwargs: object) -> AsyncIterator[SSEEvent]:
-        """Replay the canned SSE events."""
+        """Replay the canned SSE events.
+
+        Yields:
+            The canned server-sent events in order.
+
+        """
         for event in self._events:
             yield event
 
 
 def _make_request() -> ParsedRequest:
-    """Build the single-turn user request shared by every test here."""
+    """Build the single-turn user request shared by every test here.
+
+    Returns:
+        The parsed single-turn request used by every test.
+
+    """
     return ParsedRequest(
         system_text="",
         items=[HistoryItem(role="user", text="q")],
@@ -80,13 +93,23 @@ def _make_request() -> ParsedRequest:
 
 
 async def _stream_text(pool: AccountPool) -> list[str]:
-    """Run one turn, returning only the streamed delta bytes."""
+    """Run one turn, returning only the streamed delta bytes.
+
+    Returns:
+        The streamed delta bytes in order.
+
+    """
     deltas, _ = await _stream_turn(pool)
     return deltas
 
 
 async def _stream_turn(pool: AccountPool) -> tuple[list[str], TurnResult | None]:
-    """Run one turn, returning streamed bytes and the completion result."""
+    """Run one turn, returning streamed bytes and the completion result.
+
+    Returns:
+        A tuple of streamed delta bytes and the completion result, if any.
+
+    """
     deltas: list[str] = []
     result: TurnResult | None = None
     async for event in run_turn(_make_request(), pool):
@@ -102,7 +125,12 @@ async def _stream_turn(pool: AccountPool) -> tuple[list[str], TurnResult | None]
 
 
 def _user_then(events_tail: list[SSEEvent], conv_id: str = "conv-x") -> list[SSEEvent]:
-    """Prepend the shared user turn to a canned assistant event tail."""
+    """Prepend the shared user turn to a canned assistant event tail.
+
+    Returns:
+        The user-turn head followed by the given assistant event tail.
+
+    """
     head: list[SSEEvent] = [
         {
             "message": {
@@ -232,7 +260,8 @@ NORMAL_IMAGE_PHRASE_EVENTS = _user_then(
 class TestTemporaryUnavailableFailover(unittest.TestCase):
     """Regression tests for image-limit refusal failover."""
 
-    def test_refusal_fails_over_to_next_account(self) -> None:
+    @staticmethod
+    def test_refusal_fails_over_to_next_account() -> None:
         """Fail over to the next account on an image-limit refusal."""
         pool = AccountPool()
         pool.register(FakeAccount("free", "free@example.com", REFUSAL_EVENTS))
@@ -245,7 +274,8 @@ class TestTemporaryUnavailableFailover(unittest.TestCase):
         assert result is not None
         assert result.account_email == "plus@example.com"
 
-    def test_all_accounts_tried_before_error_surfaces(self) -> None:
+    @staticmethod
+    def test_all_accounts_tried_before_error_surfaces() -> None:
         """Try every account before surfacing the refusal error."""
         pool = AccountPool()
         first = FakeAccount("a", "a@example.com", REFUSAL_EVENTS)
@@ -273,7 +303,8 @@ class TestTemporaryUnavailableFailover(unittest.TestCase):
         assert streamed == []
         assert "temporarily unavailable" in str(exc_info.value)
 
-    def test_mid_text_quote_is_not_a_refusal(self) -> None:
+    @staticmethod
+    def test_mid_text_quote_is_not_a_refusal() -> None:
         """Stream a mid-text refusal quote instead of failing over."""
         pool = AccountPool()
         pool.register(FakeAccount("q", "q@example.com", QUOTE_EVENTS))
@@ -281,7 +312,8 @@ class TestTemporaryUnavailableFailover(unittest.TestCase):
         deltas = asyncio.run(_stream_text(pool))
         assert "works again now" in "".join(deltas)
 
-    def test_variant_refusal_never_leaks_mid_stream(self) -> None:
+    @staticmethod
+    def test_variant_refusal_never_leaks_mid_stream() -> None:
         """Withhold chunked variant-refusal bytes and fail over."""
         pool = AccountPool()
         pool.register(FakeAccount("free", "free@example.com", CHUNKED_VARIANT_EVENTS))
@@ -295,7 +327,8 @@ class TestTemporaryUnavailableFailover(unittest.TestCase):
         assert result is not None
         assert result.account_email == "plus@example.com"
 
-    def test_normal_reply_starting_with_phrase_streams_fully(self) -> None:
+    @staticmethod
+    def test_normal_reply_starting_with_phrase_streams_fully() -> None:
         """Stream a normal reply sharing the refusal's opening words."""
         pool = AccountPool()
         pool.register(FakeAccount("n", "n@example.com", NORMAL_IMAGE_PHRASE_EVENTS))
@@ -382,7 +415,8 @@ TEXT_AND_IMAGE_EVENTS = _user_then(
 class TestImageDeliveryFailure(unittest.TestCase):
     """Regression tests for undeliverable generated images."""
 
-    def test_image_only_turn_with_failed_delivery_errors(self) -> None:
+    @staticmethod
+    def test_image_only_turn_with_failed_delivery_errors() -> None:
         """Surface an explicit error instead of an empty success."""
         pool = AccountPool()
         pool.register(FakeAccount("img", "img@example.com", IMAGE_ONLY_EVENTS))
@@ -396,9 +430,13 @@ class TestImageDeliveryFailure(unittest.TestCase):
                         streamed.append(text)
 
         async def _fake_download(_self: AccountSession, _ptr: str) -> tuple[str, bytes]:
+            # Interface requires async because callers await this fake.
+            await asyncio.sleep(0)
             return ("night.png", b"\x89PNG fake-bytes")
 
         async def _fake_upload(_name: str, _data: bytes, _mime: str) -> str:
+            # Interface requires async because callers await this fake.
+            await asyncio.sleep(0)
             msg = "upload failed HTTP 500: internal server error"
             raise FreeimageError(msg)
 
@@ -410,15 +448,20 @@ class TestImageDeliveryFailure(unittest.TestCase):
             asyncio.run(_run())
         assert streamed == []
 
-    def test_text_turn_with_failed_delivery_streams_text(self) -> None:
+    @staticmethod
+    def test_text_turn_with_failed_delivery_streams_text() -> None:
         """Deliver produced text alone when images cannot be delivered."""
         pool = AccountPool()
         pool.register(FakeAccount("mix", "mix@example.com", TEXT_AND_IMAGE_EVENTS))
 
         async def _fake_download(_self: AccountSession, _ptr: str) -> tuple[str, bytes]:
+            # Interface requires async because callers await this fake.
+            await asyncio.sleep(0)
             return ("night.png", b"\x89PNG fake-bytes")
 
         async def _fake_upload(_name: str, _data: bytes, _mime: str) -> str:
+            # Interface requires async because callers await this fake.
+            await asyncio.sleep(0)
             msg = "upload failed HTTP 500: internal server error"
             raise FreeimageError(msg)
 
@@ -426,9 +469,9 @@ class TestImageDeliveryFailure(unittest.TestCase):
             patch.object(AccountSession, "download_file_url", _fake_download),
             patch("app.engine.upload_image", _fake_upload),
         ):
-            _deltas, result = asyncio.run(_stream_turn(pool))
+            deltas, result = asyncio.run(_stream_turn(pool))
         assert result is not None
-        assert "Here is the analysis." in "".join(_deltas)
+        assert "Here is the analysis." in "".join(deltas)
         assert "Here is the analysis." in result.text
 
 

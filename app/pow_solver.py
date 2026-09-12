@@ -1,10 +1,9 @@
 # Copyright 2026 chatgpt-to-openai-api contributors.
-"""ChatGPT sentinel proof-of-work solver (sha3-512 hashcash)."""
+"""ChatGPT sentinel proof-of-work solver (FNV-1a hashcash)."""
 
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import secrets
 import time
@@ -14,6 +13,7 @@ from dataclasses import dataclass
 _SCREENS = [3000, 4000, 6000]
 _CORES = [8, 12, 16, 24]
 _PROOF_PREFIX = "gAAAAAB"
+_PROOF_SUFFIX = "~S"
 _REQUIREMENTS_DIFFICULTY = "0"
 
 
@@ -33,6 +33,25 @@ def _parse_time() -> str:
     )
 
 
+def fnv_hash(value: str) -> str:
+    """FNV-1a 32-bit hash matching the chatgpt.com frontend (pFt).
+
+    Returns:
+        The 8-character lowercase hex digest of the value.
+
+    """
+    h = 2166136261
+    for ch in value:
+        h ^= ord(ch)
+        h = (h * 16777619) & 0xFFFFFFFF
+    h ^= h >> 16
+    h = (h * 2246822507) & 0xFFFFFFFF
+    h ^= h >> 13
+    h = (h * 3266489909) & 0xFFFFFFFF
+    h ^= h >> 16
+    return format(h & 0xFFFFFFFF, "08x")
+
+
 def solve(
     seed: str,
     difficulty: str,
@@ -40,8 +59,15 @@ def solve(
 ) -> str:
     """Solve the sentinel proof of work, returning the proof string.
 
-    The proof is 'gAAAAAB' plus base64(config json) whose
-    sha3-512(seed + base) hex prefix does not exceed difficulty.
+    The proof is 'gAAAAAB' plus base64(config json) plus '~S' whose
+    FNV-1a(seed + base) hex prefix does not exceed difficulty.
+
+    Returns:
+        The proof string to send with the sentinel request.
+
+    Raises:
+        RuntimeError: If no proof is found within max_iters iterations.
+
     """
     opts = options if options is not None else PowOptions()
     start_wall = time.time()
@@ -72,9 +98,9 @@ def solve(
         cfg[9] = round((time.time() - started) * 1000)
         encoded = base64.b64encode(json.dumps(cfg, separators=(",", ":")).encode())
         proof_body = encoded.decode()
-        digest = hashlib.sha3_512((seed + proof_body).encode()).hexdigest()
+        digest = fnv_hash(seed + proof_body)
         if digest[:width] <= difficulty:
-            return _PROOF_PREFIX + proof_body
+            return _PROOF_PREFIX + proof_body + _PROOF_SUFFIX
     msg = (
         f"proof-of-work unsolved after {opts.max_iters} "
         f"iterations (difficulty={difficulty})"
@@ -86,6 +112,10 @@ def pre_proof(user_agent: str = "") -> str:
     """Build the proof for the chat-requirements call itself.
 
     The requirements endpoint always uses difficulty '0'.
+
+    Returns:
+        The proof string for the chat-requirements call.
+
     """
     seed = str(secrets.SystemRandom().random())
     options = PowOptions(user_agent=user_agent)

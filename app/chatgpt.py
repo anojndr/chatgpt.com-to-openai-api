@@ -90,6 +90,10 @@ def parse_accounts_text(text: str) -> list[dict[str, Any]]:
 
     Each '<<<' ... '>>>' block holds a netscape cookie jar and the JSON
     body of https://chatgpt.com/api/auth/session.
+
+    Returns:
+        Session dicts for blocks with a usable access token.
+
     """
     accounts: list[dict[str, Any]] = []
     for b in BLOCK_RE.findall(text):
@@ -129,7 +133,12 @@ def parse_accounts_text(text: str) -> list[dict[str, Any]]:
 
 
 def block_session(block_text: str) -> dict[str, Any] | None:
-    """Session JSON of one raw '<<<' ... '>>>' block body, or None."""
+    """Return the session JSON of one raw block body, or None.
+
+    Returns:
+        The decoded session dict, or None when the block has no session JSON.
+
+    """
     m = re.search(
         r"from https://chatgpt\.com/api/auth/session:\s*(\{.*)",
         block_text,
@@ -144,7 +153,12 @@ def block_session(block_text: str) -> dict[str, Any] | None:
 
 
 def block_identity(block_text: str) -> str | None:
-    """Identity of one raw '<<<' ... '>>>' block body (for block replacement)."""
+    """Return the identity of one raw block body for block replacement.
+
+    Returns:
+        The user or account id, or None when the block has no identity.
+
+    """
     sess = block_session(block_text)
     if not sess:
         return None
@@ -162,15 +176,23 @@ def _set_cookie_headers(response: object) -> list[str]:
 
     Understands curl responses (get_list) and generic mappings
     (multi_items), so one entry per header survives Expires commas.
+
+    Returns:
+        One raw Set-Cookie value per header, or an empty list.
+
     """
-    try:
-        headers = getattr(response, "headers", None)
-        get_list = getattr(headers, "get_list", None)
-        if get_list is not None:
+    headers = getattr(response, "headers", None)
+    get_list = getattr(headers, "get_list", None)
+    if get_list is not None:
+        try:
             values = get_list("set-cookie") or []
             return [v for v in values if isinstance(v, str)]
-        multi_items = getattr(headers, "multi_items", None)
-        if multi_items is not None:
+        except (AttributeError, TypeError, ValueError) as e:
+            log.debug("set-cookie header read failed: %s", e)
+            return []
+    multi_items = getattr(headers, "multi_items", None)
+    if multi_items is not None:
+        try:
             return [
                 v
                 for k, v in multi_items()
@@ -178,13 +200,19 @@ def _set_cookie_headers(response: object) -> list[str]:
                 and k.lower() == "set-cookie"
                 and isinstance(v, str)
             ]
-    except (AttributeError, TypeError, ValueError) as e:
-        log.debug("set-cookie header read failed: %s", e)
+        except (AttributeError, TypeError, ValueError) as e:
+            log.debug("set-cookie header read failed: %s", e)
+            return []
     return []
 
 
 def _parse_cookie_jar(headers: list[str]) -> SimpleCookie:
-    """Parse raw Set-Cookie values, skipping malformed entries."""
+    """Parse raw Set-Cookie values, skipping malformed entries.
+
+    Returns:
+        The parsed cookie jar.
+
+    """
     jar = SimpleCookie()
     for header in headers:
         if not header:
@@ -203,7 +231,12 @@ def _conversation_body(
     parent_message_id: str,
     model: str,
 ) -> dict[str, Any]:
-    """Build the POST /conversation JSON body for one turn."""
+    """Build the POST /conversation JSON body for one turn.
+
+    Returns:
+        The JSON-serializable request body for one turn.
+
+    """
     raw_pointers = media.image_pointers if media else None
     image_pointers = [p for p in (raw_pointers or []) if isinstance(p, dict)]
     parts: list[str | dict[str, Any]] = ([prompt_text] if prompt_text else []) + (
@@ -245,7 +278,7 @@ class AccountSession:
         self.raw_cookie_lines: list[str] = list(parsed.get("raw_cookie_lines") or [])
         s = parsed["session"]
         self.access_token: str = s["accessToken"]
-        self._jwt_exp: float = _jwt_exp(self.access_token)
+        self.jwt_exp: float = _jwt_exp(self.access_token)
         self.expires_at: float = _parse_expires(s.get("expires"))
         self.account_id: str = s.get("account", {}).get("id", "")
         self.plan: str = s.get("account", {}).get("planType", "free")
@@ -258,73 +291,51 @@ class AccountSession:
         self.dead: bool = False
         # keepalive state
         self.refresh_strikes: int = 0
-        self._last_strike_at: float = 0.0
+        self.last_strike_at: float = 0.0
         self.revive_after: float = 0.0
         self.state_dirty: bool = False
         self._refreshing: bool = False  # network refresh in flight
-        self._refresh_ok: bool = False  # last completed refresh succeeded
+        self.refresh_ok: bool = False  # last completed refresh succeeded
         # http/sentinel state
         self._http: AsyncSession[Response] | None = None
         self._req: Requirements | None = None
         self._build_id: str = ""
         self._scripts: list[str] = []
         self._models_cache: tuple[float, list[dict[str, Any]]] | None = None
-        self._last_refresh_attempt: float = 0.0
+        self.last_refresh_attempt: float = 0.0
         self._closed: bool = False
 
     @property
-    def jwt_exp(self) -> float:
-        """Expiry of the current access token as a Unix timestamp."""
-        return self._jwt_exp
-
-    @jwt_exp.setter
-    def jwt_exp(self, value: float) -> None:
-        """Record a new access-token expiry timestamp."""
-        self._jwt_exp = value
-
-    @property
     def is_closed(self) -> bool:
-        """Whether this session was removed from the pool."""
+        """Whether this session was removed from the pool.
+
+        Returns:
+            True when the session was removed from the pool.
+
+        """
         return self._closed
 
     @property
     def is_refreshing(self) -> bool:
-        """Whether a token refresh is currently in flight."""
+        """Whether a token refresh is currently in flight.
+
+        Returns:
+            True while a token refresh is in flight.
+
+        """
         return self._refreshing
-
-    @property
-    def last_refresh_attempt(self) -> float:
-        """Unix timestamp of the last refresh attempt."""
-        return self._last_refresh_attempt
-
-    @last_refresh_attempt.setter
-    def last_refresh_attempt(self, value: float) -> None:
-        """Record the timestamp of a refresh attempt."""
-        self._last_refresh_attempt = value
-
-    @property
-    def last_strike_at(self) -> float:
-        """Unix timestamp of the last refresh strike."""
-        return self._last_strike_at
-
-    @last_strike_at.setter
-    def last_strike_at(self, value: float) -> None:
-        """Record the timestamp of a refresh strike."""
-        self._last_strike_at = value
-
-    @property
-    def refresh_ok(self) -> bool:
-        """Whether the last completed refresh succeeded."""
-        return self._refresh_ok
-
-    @refresh_ok.setter
-    def refresh_ok(self, value: bool) -> None:
-        """Record the outcome of the last completed refresh."""
-        self._refresh_ok = value
 
     # ---------- http ----------
     async def http(self) -> AsyncSession[Response]:
-        """Return the live TLS-impersonated session, creating it on first use."""
+        """Return the live TLS-impersonated session, creating it on first use.
+
+        Returns:
+            The live impersonated HTTP session.
+
+        Raises:
+            ChatGPTError: If the session was removed from the pool.
+
+        """
         if self._closed:
             raise ChatGPTError(
                 503,
@@ -337,7 +348,12 @@ class AccountSession:
         return self._http
 
     def base_headers(self) -> dict[str, str]:
-        """Return the per-request headers shared by every backend call."""
+        """Return the per-request headers shared by every backend call.
+
+        Returns:
+            Headers shared by every backend call.
+
+        """
         h = {
             "Oai-Device-Id": self.cookies.get("oai-did", str(uuid.uuid4())),
             "Oai-Language": "en-US",
@@ -345,7 +361,7 @@ class AccountSession:
         }
         # Session cookies alone authenticate backend-api; include Bearer only when
         # the access-token JWT is actually valid (expired tokens cause 401s).
-        if self.access_token and time.time() < self._jwt_exp - TOKEN_EXPIRY_SKEW_S:
+        if self.access_token and time.time() < self.jwt_exp - TOKEN_EXPIRY_SKEW_S:
             h["Authorization"] = f"Bearer {self.access_token}"
         if self.account_id:
             h["Chatgpt-Account-Id"] = self.account_id
@@ -361,7 +377,9 @@ class AccountSession:
     def detach_transport(self) -> AsyncSession[Response] | None:
         """Detach the HTTP session and drop the sentinel cache.
 
-        Return the detached session, if any, for the caller to close.
+        Returns:
+            The detached session, if any, for the caller to close.
+
         """
         old = self._http
         self._http = None
@@ -381,34 +399,37 @@ class AccountSession:
         fresh-enough token counts one strike; KEEPALIVE_MAX_STRIKES spaced
         strikes mean the session cookie itself is stale -> dead (needs
         re-login).
+
+        Returns:
+            True when the token was refreshed or is still valid, else False.
+
         """
+        # One refresh per account at a time; request paths and the
+        # keepalive sweep all funnel through here. While one is in
+        # flight (or concluded recently) report the cached outcome
+        # instead of firing a second request.
+        if (
+            self._refreshing
+            or time.time() - self.last_refresh_attempt < REFRESH_DEDUP_WINDOW_S
+        ):
+            return bool(
+                self.refresh_ok
+                and self.access_token
+                and time.time() < self.jwt_exp - TOKEN_EXPIRY_SKEW_S,
+            )
+        self.last_refresh_attempt = time.time()
+        self._refreshing = True
         try:
-            # One refresh per account at a time; request paths and the
-            # keepalive sweep all funnel through here. While one is in
-            # flight (or concluded recently) report the cached outcome
-            # instead of firing a second request.
-            if (
-                self._refreshing
-                or time.time() - self._last_refresh_attempt < REFRESH_DEDUP_WINDOW_S
-            ):
-                return bool(
-                    self._refresh_ok
-                    and self.access_token
-                    and time.time() < self._jwt_exp - TOKEN_EXPIRY_SKEW_S,
-                )
-            self._last_refresh_attempt = time.time()
-            self._refreshing = True
-            try:
-                return await self._do_refresh()
-            finally:
-                self._refreshing = False
+            return await self._do_refresh()
         except (ChatGPTError, RequestException, OSError, ValueError) as e:
-            self._refresh_ok = False
+            self.refresh_ok = False
             log.warning("[%s] refresh failed: %s", self.email, e)
             return False
+        finally:
+            self._refreshing = False
 
     async def _do_refresh(self) -> bool:
-        self._refresh_ok = False
+        self.refresh_ok = False
         s = await self.http()
         r = await s.get(
             f"{CHATGPT_ORIGIN}/api/auth/session",
@@ -437,7 +458,7 @@ class AccountSession:
                 f"session returned an {kind} access token ({remaining}s left)"
             )
         self.access_token = new_at
-        self._jwt_exp = new_exp
+        self.jwt_exp = new_exp
         self.session_json = j
         exp = _parse_expires(j.get("expires"))
         if exp:
@@ -449,7 +470,7 @@ class AccountSession:
         self.refresh_strikes = 0
         self.dead = False
         self.state_dirty = True
-        self._refresh_ok = True
+        self.refresh_ok = True
         log.info("[%s] access token refreshed", self.email)
         return True
 
@@ -458,11 +479,15 @@ class AccountSession:
 
         Strikes older than two sweep intervals are forgiven first, so only
         KEEPALIVE_MAX_STRIKES consecutive failures mark the account dead.
+
+        Returns:
+            False always; the boolean signals refresh failure to callers.
+
         """
         now = time.time()
-        if now - self._last_strike_at > 2 * config.KEEPALIVE_SECONDS:
+        if now - self.last_strike_at > 2 * config.KEEPALIVE_SECONDS:
             self.refresh_strikes = 0  # stale evidence: not a consecutive run
-        self._last_strike_at = now
+        self.last_strike_at = now
         self.refresh_strikes += 1
         if self.refresh_strikes >= config.KEEPALIVE_MAX_STRIKES:
             self.dead = True
@@ -484,7 +509,12 @@ class AccountSession:
         return False
 
     def record_refresh_failure(self, detail: str) -> bool:
-        """Count one confirmed-but-unusable session response, returning False."""
+        """Count one confirmed-but-unusable session response.
+
+        Returns:
+            False always; the boolean signals refresh failure to callers.
+
+        """
         return self._record_refresh_failure(detail)
 
     def _absorb_cookies(self, response: object) -> None:
@@ -570,14 +600,22 @@ class AccountSession:
         """
         if (
             self.access_token
-            and time.time() > self._jwt_exp - TOKEN_EAGER_REFRESH_WINDOW_S
-            and time.time() - self._last_refresh_attempt > REFRESH_NUDGE_INTERVAL_S
+            and time.time() > self.jwt_exp - TOKEN_EAGER_REFRESH_WINDOW_S
+            and time.time() - self.last_refresh_attempt > REFRESH_NUDGE_INTERVAL_S
         ):
             await self.refresh_access_token()
 
     # ---------- sentinel ----------
     async def requirements(self, *, force: bool = False) -> Requirements:
-        """Fetch and cache sentinel chat-requirements, solving proof-of-work."""
+        """Fetch and cache sentinel chat-requirements, solving proof-of-work.
+
+        Returns:
+            The cached sentinel requirements.
+
+        Raises:
+            ChatGPTError: If sentinel blocks the request or proof-of-work fails.
+
+        """
         now = time.time()
         if (
             not force
@@ -641,6 +679,9 @@ class AccountSession:
             if r.status_code == HTTP_OK:
                 m = re.search(r'data-build="([^"]+)"', r.text)
                 self._build_id = m.group(1) if m else ""
+                # Frontend is now React Router (inline module scripts, no
+                # <script src>); document.scripts is src-less so the browser
+                # PoW script field is undefined — empty here matches it.
                 self._scripts = re.findall(r'<script[^>]+src="([^"]+)"', r.text)[:3]
         except (RequestException, OSError, ValueError) as e:
             log.debug("build info fetch failed: %s", e)
@@ -662,6 +703,10 @@ class AccountSession:
         parent_message_id: id to continue from, or a fresh client UUID
         conversation_id: server conversation to continue, if any
         model: backend model slug
+
+        Yields:
+            Raw SSE event payloads, ending with a done sentinel.
+
         """
         await self.ensure_token()
         await self._ensure_build_info()  # warm build id/scripts for proof config
@@ -697,6 +742,10 @@ class AccountSession:
         server-side: a cookie-only request silently degrades ChatGPT to an
         anonymous conversation that refuses image asks. Raising 401 lets the
         pool rotate to an account that can actually serve them.
+
+        Raises:
+            ChatGPTError: If the account is dead or has no valid access token.
+
         """
         if self.dead:
             raise ChatGPTError(
@@ -704,7 +753,7 @@ class AccountSession:
                 f"[{self.email}] session is stale (dead); re-login this "
                 "account to generate images",
             )
-        if self.access_token and time.time() < self._jwt_exp - TOKEN_EXPIRY_SKEW_S:
+        if self.access_token and time.time() < self.jwt_exp - TOKEN_EXPIRY_SKEW_S:
             return
         if not await self.refresh_access_token():
             reason = "session removed" if self._closed else "stale session cookie"
@@ -718,7 +767,11 @@ class AccountSession:
         """POST one conversation turn, retrying sentinel/token failures.
 
         A 403 retries with a fresh sentinel token; a 401 retries after a
-        token refresh. Return the final response for the caller to stream.
+        token refresh.
+
+        Returns:
+            The final response for the caller to stream.
+
         """
         session = await self.http()
         response = None
@@ -769,6 +822,10 @@ class AccountSession:
         Reads a short excerpt of the error body; a transport failure while
         reading falls back to an empty body since the HTTP status (which the
         pool cooldown keys off) is the actionable part.
+
+        Raises:
+            ChatGPTError: If the conversation response is not a success.
+
         """
         if response.status_code == HTTP_UNAUTHORIZED:
             raise ChatGPTError(HTTP_UNAUTHORIZED, "unauthorized")
@@ -777,7 +834,7 @@ class AccountSession:
         # 429/403 bodies (quota/sentinel pages) get a tighter excerpt.
         limit = (
             300
-            if response.status_code in (HTTP_TOO_MANY_REQUESTS, HTTP_FORBIDDEN)
+            if response.status_code in {HTTP_TOO_MANY_REQUESTS, HTTP_FORBIDDEN}
             else 500
         )
         try:
@@ -789,7 +846,15 @@ class AccountSession:
 
     # ---------- models ----------
     async def models(self) -> list[dict[str, Any]]:
-        """Return the cached backend model list, refreshing it hourly."""
+        """Return the cached backend model list, refreshing it hourly.
+
+        Returns:
+            The backend model list.
+
+        Raises:
+            ChatGPTError: If the models request fails.
+
+        """
         now = time.time()
         if self._models_cache and now - self._models_cache[0] < MODELS_CACHE_TTL_S:
             return self._models_cache[1]
@@ -822,7 +887,15 @@ class AccountSession:
         *,
         is_image: bool,
     ) -> str:
-        """Upload bytes and return the file id once the blob finalizes."""
+        """Upload bytes and return the file id once the blob finalizes.
+
+        Returns:
+            The finalized file id.
+
+        Raises:
+            ChatGPTError: If auth, creation, upload, or finalization fails.
+
+        """
         use_case = "multimodal" if is_image else "ace_upload"
         log.debug("[%s] uploading %s (%s, %d bytes)", self.email, name, mime, len(data))
         await self.ensure_token()
@@ -860,7 +933,7 @@ class AccountSession:
             headers={"x-ms-blob-type": "BlockBlob", "x-ms-version": "2020-04-08"},
             timeout=120,
         )
-        if put.status_code not in (HTTP_OK, 201):
+        if put.status_code not in {HTTP_OK, 201}:
             raise ChatGPTError(
                 put.status_code,
                 f"blob upload failed: {put.status_code}",
@@ -879,7 +952,12 @@ class AccountSession:
         return file_id
 
     async def wait_file_ready(self, file_id: str, timeout_s: float = 20) -> bool:
-        """Poll the file endpoint until processing succeeds or times out."""
+        """Poll the file endpoint until processing succeeds or times out.
+
+        Returns:
+            True when processing succeeds before the timeout, else False.
+
+        """
         s = await self.http()
         t0 = time.time()
         while time.time() - t0 < timeout_s:
@@ -893,7 +971,7 @@ class AccountSession:
                 # "state"; read either so the poll can actually observe it.
                 j = r.json()
                 st = j.get("status") or j.get("state")
-                if st in ("success", "ready"):
+                if st in {"success", "ready"}:
                     return True
                 if st == "error":
                     return False
@@ -901,7 +979,15 @@ class AccountSession:
         return False
 
     async def download_file_url(self, pointer: str) -> tuple[str, bytes]:
-        """Resolve sediment:// or file-service:// pointers to (filename, bytes)."""
+        """Resolve sediment:// or file-service:// pointers to (filename, bytes).
+
+        Returns:
+            The resolved filename and bytes.
+
+        Raises:
+            ChatGPTError: If resolving or fetching the file fails.
+
+        """
         file_id = pointer.split("//", 1)[1]
         await self.ensure_token()
         s = await self.http()
@@ -931,7 +1017,12 @@ class AccountSession:
 
 
 def _jwt_exp(token: str) -> float:
-    """Best-effort exp claim from an RS256 access-token JWT."""
+    """Return the best-effort exp claim from an RS256 access-token JWT.
+
+    Returns:
+        The exp claim as Unix seconds, or 0.0 when unparseable.
+
+    """
     try:
         payload = token.split(".")[1]
         padded = payload + "=" * (-len(payload) % 4)
@@ -943,7 +1034,12 @@ def _jwt_exp(token: str) -> float:
 
 
 def _parse_expires(value: object) -> float:
-    """Parse an expiry timestamp into Unix seconds, forgiving garbage."""
+    """Parse an expiry timestamp into Unix seconds, forgiving garbage.
+
+    Returns:
+        The expiry as Unix seconds, or 0.0 when missing or unparseable.
+
+    """
     if not value:
         return 0.0
     try:

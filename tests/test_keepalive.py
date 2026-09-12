@@ -17,7 +17,7 @@ from unittest.mock import patch
 from typing_extensions import override
 
 from app import config
-from app.accounts import AccountPool, _render_block_body
+from app.accounts import AccountPool, render_block_body
 from app.chatgpt import AccountSession, parse_accounts_text
 
 SEEDED_STRIKE_COUNT = 2
@@ -32,10 +32,16 @@ class _UnexpectedBodyError(AssertionError):
 
 
 def _mk_jwt(exp: float) -> str:
-    """Minimal unsigned JWT with just an exp claim (only exp is ever read)."""
+    """Minimal unsigned JWT with just an exp claim (only exp is ever read).
+
+    Returns:
+        Unsigned JWT string carrying only the exp claim.
+
+    """
     head = base64.urlsafe_b64encode(b'{"alg":"RS256","typ":"JWT"}').decode().rstrip("=")
     payload = (
-        base64.urlsafe_b64encode(
+        base64
+        .urlsafe_b64encode(
             json.dumps({"exp": exp, "iat": int(exp) - 900}).encode(),
         )
         .decode()
@@ -45,7 +51,12 @@ def _mk_jwt(exp: float) -> str:
 
 
 def _mk_session(user_id: str, email: str, exp: float) -> dict[str, object]:
-    """Build a minimal session payload for the given user."""
+    """Build a minimal session payload for the given user.
+
+    Returns:
+        Minimal session payload dict for the user.
+
+    """
     return {
         "user": {
             "id": user_id,
@@ -59,8 +70,13 @@ def _mk_session(user_id: str, email: str, exp: float) -> dict[str, object]:
 
 
 def _mk_block(user_id: str, email: str, exp: float, cookie_value: str = "st-1") -> str:
-    """Render an accounts.txt block for the given user."""
-    body = _render_block_body(
+    """Render an accounts.txt block for the given user.
+
+    Returns:
+        Rendered accounts.txt block text for the user.
+
+    """
+    body = render_block_body(
         AccountSession(
             {
                 "session": _mk_session(user_id, email, exp),
@@ -103,7 +119,8 @@ class KeepaliveTestCase(unittest.TestCase):
     def _write(self, *blocks: str) -> None:
         self.path.write_text("\n".join(blocks))
 
-    def _pool(self) -> AccountPool:
+    @staticmethod
+    def _pool() -> AccountPool:
         pool = AccountPool()
         pool.load()
         return pool
@@ -131,7 +148,12 @@ class TestCookieAbsorption(KeepaliveTestCase):
 
                 @staticmethod
                 def get_list(_name: str) -> list[str]:
-                    """Return canned Set-Cookie header values."""
+                    """Return canned Set-Cookie header values.
+
+                    Returns:
+                        Canned Set-Cookie header values.
+
+                    """
                     return [
                         "tok=new; Path=/; Domain=.chatgpt.com; Secure; HttpOnly",
                     ]
@@ -165,7 +187,12 @@ class TestCookieAbsorption(KeepaliveTestCase):
 
                 @staticmethod
                 def get_list(_name: str) -> list[str]:
-                    """Return canned Set-Cookie header values."""
+                    """Return canned Set-Cookie header values.
+
+                    Returns:
+                        Canned Set-Cookie header values.
+
+                    """
                     return ["tok=old; Path=/"]
 
             headers = Headers()
@@ -227,22 +254,46 @@ class TestRefreshStrikes(KeepaliveTestCase):
 
             status_code = 503
 
-            def json(self) -> NoReturn:
-                """Reject JSON parsing on non-200 responses."""
+            @staticmethod
+            def json() -> NoReturn:
+                """Reject JSON parsing on non-200 responses.
+
+                Raises:
+                    _UnexpectedBodyError: Always raised; body must not parse.
+
+                """
                 raise _UnexpectedBodyError
 
         class FakeSession:
             """Stub HTTP session returning a canned 503 response."""
 
-            async def get(self, *_args: object, **_kwargs: object) -> FakeResponse:
-                """Return a canned transient-failure response."""
+            @staticmethod
+            async def get(*_args: object, **_kwargs: object) -> FakeResponse:
+                """Return a canned transient-failure response.
+
+                Returns:
+                    Canned transient-failure response.
+
+                """
                 return FakeResponse()
 
         async def run() -> bool:
-            """Run one refresh against the stub session."""
+            """Run one refresh against the stub session.
+
+            Returns:
+                Refresh outcome from the stub session.
+
+            """
 
             async def fake_http() -> FakeSession:
-                """Return the stub session."""
+                """Return the stub session.
+
+                Returns:
+                    Stub HTTP session.
+
+                """
+                # Interface requires async (callers await self.http()).
+                await asyncio.sleep(0)
                 return FakeSession()
 
             with patch.object(acct, "http", new=fake_http):
@@ -271,7 +322,12 @@ class TestRefreshStrikes(KeepaliveTestCase):
 
                 @staticmethod
                 def get_list(_name: str) -> list[str]:
-                    """Return canned Set-Cookie header values."""
+                    """Return canned Set-Cookie header values.
+
+                    Returns:
+                        Canned Set-Cookie header values.
+
+                    """
                     return ["tok=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT"]
 
             headers = Headers()
@@ -326,12 +382,25 @@ class TestRefreshStrikes(KeepaliveTestCase):
         class FakeSession:
             """Stub HTTP session returning a canned 503 response."""
 
-            async def get(self, *_args: object, **_kwargs: object) -> FakeResponse:
-                """Return a canned transient-failure response."""
+            @staticmethod
+            async def get(*_args: object, **_kwargs: object) -> FakeResponse:
+                """Return a canned transient-failure response.
+
+                Returns:
+                    Canned transient-failure response.
+
+                """
                 return FakeResponse()
 
         async def fake_http() -> FakeSession:
-            """Return the stub session."""
+            """Return the stub session.
+
+            Returns:
+                Stub HTTP session.
+
+            """
+            # Interface requires async (callers await self.http()).
+            await asyncio.sleep(0)
             return FakeSession()
 
         with patch.object(acct, "http", new=fake_http):
@@ -353,7 +422,14 @@ class TestRefreshStrikes(KeepaliveTestCase):
         calls: list[int] = []
 
         async def fake_refresh() -> bool:
-            """Record the refresh call and report success."""
+            """Record the refresh call and report success.
+
+            Returns:
+                True to signal a successful refresh.
+
+            """
+            # Interface requires async (callers await refresh_access_token()).
+            await asyncio.sleep(0)
             calls.append(1)
             return True
 
@@ -542,7 +618,14 @@ class TestHotSwap(KeepaliveTestCase):
         calls: list[int] = []
 
         async def fake_refresh() -> bool:
-            """Apply a fresh session and report success."""
+            """Apply a fresh session and report success.
+
+            Returns:
+                True to signal a successful refresh.
+
+            """
+            # Interface requires async (callers await refresh_access_token()).
+            await asyncio.sleep(0)
             calls.append(1)
             acct.session_json = fresh
             acct.access_token = rotated
@@ -565,7 +648,14 @@ class TestHotSwap(KeepaliveTestCase):
         calls: list[int] = []
 
         async def fake_refresh() -> bool:
-            """Record the refresh call and report success."""
+            """Record the refresh call and report success.
+
+            Returns:
+                True to signal a successful refresh.
+
+            """
+            # Interface requires async (callers await refresh_access_token()).
+            await asyncio.sleep(0)
             calls.append(1)
             return True
 
@@ -585,7 +675,14 @@ class TestHotSwap(KeepaliveTestCase):
         acct.revive_after = self.now - 1
 
         async def fake_refresh() -> bool:
-            """Clear the dead flag and report success."""
+            """Clear the dead flag and report success.
+
+            Returns:
+                True to signal a successful refresh.
+
+            """
+            # Interface requires async (callers await refresh_access_token()).
+            await asyncio.sleep(0)
             acct.dead = False
             return True
 
@@ -606,7 +703,14 @@ class TestHotSwap(KeepaliveTestCase):
         calls: list[int] = []
 
         async def fake_refresh() -> bool:
-            """Record the refresh call and report success."""
+            """Record the refresh call and report success.
+
+            Returns:
+                True to signal a successful refresh.
+
+            """
+            # Interface requires async (callers await refresh_access_token()).
+            await asyncio.sleep(0)
             calls.append(1)
             return True
 
@@ -632,7 +736,7 @@ class TestRenderRoundTrip(KeepaliveTestCase):
                 "identity": "u1",
             },
         )
-        parsed = parse_accounts_text(_render_block_body(acct))
+        parsed = parse_accounts_text(render_block_body(acct))
         assert len(parsed) == 1
         p = parsed[0]
         assert p["identity"] == "u1"
@@ -646,7 +750,7 @@ class TestRenderRoundTrip(KeepaliveTestCase):
             "#HttpOnly_.chatgpt.com\tTRUE\t/\tTRUE\t2147483647\t"
             "__Secure-next-auth.session-token.0\tSECRET"
         )
-        text = "account 1:\n" + _render_block_body(
+        text = "account 1:\n" + render_block_body(
             AccountSession(
                 {
                     "session": _mk_session("u1", "a@x.com", self.now + 3600),

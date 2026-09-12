@@ -69,17 +69,32 @@ MAX_CHART_ROWS = 400
 
 
 def _is_dict(value: object) -> TypeGuard[dict[str, object]]:
-    """Check whether the value is a string-keyed mapping."""
+    """Check whether the value is a string-keyed mapping.
+
+    Returns:
+        True when the value is a dict.
+
+    """
     return isinstance(value, dict)
 
 
 def _is_list(value: object) -> TypeGuard[list[object]]:
-    """Check whether the value is a list."""
+    """Check whether the value is a list.
+
+    Returns:
+        True when the value is a list.
+
+    """
     return isinstance(value, list)
 
 
 def chart_from_payload(payload: dict[str, object]) -> dict[str, object] | None:
-    """Build a normalized chart spec from a genui payload, if it holds one."""
+    """Build a normalized chart spec from a genui payload, if it holds one.
+
+    Returns:
+        The normalized chart spec, or None when the payload holds no chart.
+
+    """
     chart_raw = payload.get("chart")
     if not _is_dict(chart_raw):
         return None
@@ -109,7 +124,12 @@ def chart_from_payload(payload: dict[str, object]) -> dict[str, object] | None:
 
 
 def _font(size: int, *, bold: bool = False) -> _ChartFont:
-    """Load a DejaVu font, falling back to PIL's default bitmap font."""
+    """Load a DejaVu font, falling back to PIL's default bitmap font.
+
+    Returns:
+        The loaded typeface at the requested size.
+
+    """
     name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
     try:
         return ImageFont.truetype(f"{FONT_DIR}/{name}", size)
@@ -124,7 +144,12 @@ def _wrap(
     max_w: int,
     limit: int,
 ) -> list[str]:
-    """Wrap text to at most limit lines fitting max_w pixels."""
+    """Wrap text to at most limit lines fitting max_w pixels.
+
+    Returns:
+        The wrapped lines, with an ellipsis on the last line when truncated.
+
+    """
     lines: list[str] = []
     current = ""
     for word in str(text or "").split():
@@ -148,7 +173,12 @@ def _wrap(
 
 
 def _fmt_value(value: float, fmt: str | None) -> str:
-    """Format one chart value, honoring the series value format."""
+    """Format one chart value, honoring the series value format.
+
+    Returns:
+        The formatted value string.
+
+    """
     if fmt == "percent":
         return f"{value:g}%"
     if isinstance(value, float) and value.is_integer():
@@ -157,7 +187,12 @@ def _fmt_value(value: float, fmt: str | None) -> str:
 
 
 def _nice_ticks(ymax: float) -> tuple[float, float]:
-    """Return (nice_max, step) covering [0, ymax] with ~4-5 ticks."""
+    """Return (nice_max, step) covering [0, ymax] with ~4-5 ticks.
+
+    Returns:
+        Tuple of the rounded axis maximum and the tick step.
+
+    """
     if ymax <= 0:
         return _FALLBACK_TICK_MAX, _FALLBACK_TICK_STEP
     raw = ymax / _TICK_TARGET_COUNT
@@ -174,7 +209,12 @@ def _nice_ticks(ymax: float) -> tuple[float, float]:
 
 
 def _vtext(text: str, font: _ChartFont, fill: str) -> Image.Image:
-    """Render text rotated 90 degrees for the vertical axis label."""
+    """Render text rotated 90 degrees for the vertical axis label.
+
+    Returns:
+        The rotated text image.
+
+    """
     tmp = Image.new("RGB", (_PROBE_SIZE, _PROBE_SIZE))
     probe = ImageDraw.Draw(tmp)
     box = probe.textbbox((0, 0), text, font=font)
@@ -230,7 +270,12 @@ class _ChartLayout:
 
 
 def _load_chart_fonts() -> _ChartFonts:
-    """Load every chart typeface."""
+    """Load every chart typeface.
+
+    Returns:
+        The loaded title, description, tick, value, footer, and axis fonts.
+
+    """
     return _ChartFonts(
         title=_font(31, bold=True),
         description=_font(19),
@@ -242,10 +287,18 @@ def _load_chart_fonts() -> _ChartFonts:
 
 
 def _coerce_chart_spec(spec: dict[str, object]) -> _ChartSpec:
-    """Validate a normalized chart spec, raising ChartError when unusable."""
+    """Validate a normalized chart spec, raising ChartError when unusable.
+
+    Returns:
+        The validated chart render inputs.
+
+    Raises:
+        ChartError: If the type, meta, keys, series, or data is unusable.
+
+    """
     chart_type_raw = spec.get("type")
     chart_type = chart_type_raw if isinstance(chart_type_raw, str) else ""
-    if chart_type not in ("bar", "column"):
+    if chart_type not in {"bar", "column"}:
         msg = f"unsupported chartType {chart_type!r}"
         raise ChartError(msg)
     meta_raw = spec.get("meta")
@@ -283,6 +336,26 @@ def _coerce_chart_spec(spec: dict[str, object]) -> _ChartSpec:
     )
 
 
+def _layout_geometry(
+    title_lines: list[str],
+    desc_lines: list[str],
+    foot_lines: list[str],
+    max_label_lines: int,
+) -> tuple[int, int, int]:
+    """Compute vertical pixel geometry from wrapped text.
+
+    Returns:
+        Tuple of the top offset, bottom offset, and total height.
+
+    """
+    title_height = len(title_lines) * 40
+    desc_height = len(desc_lines) * 25 + 12 if desc_lines else 0
+    top = 26 + title_height + desc_height
+    bottom = max_label_lines * 21 + 10 + (26 if foot_lines else 14)
+    height = top + _PLOT_HEIGHT + bottom
+    return top, bottom, height
+
+
 def _prepare_layout(
     meta: dict[str, object],
     x_key: str,
@@ -290,7 +363,12 @@ def _prepare_layout(
     width: int,
     fonts: _ChartFonts,
 ) -> _ChartLayout:
-    """Wrap chart text and compute pixel geometry."""
+    """Wrap chart text and compute pixel geometry.
+
+    Returns:
+        The pixel geometry and wrapped text for one chart render.
+
+    """
     probe = ImageDraw.Draw(Image.new("RGB", (_PROBE_SIZE, _PROBE_SIZE)))
     left_margin = _LEFT_MARGIN
     right_margin = _RIGHT_MARGIN
@@ -319,11 +397,9 @@ def _prepare_layout(
         for label in labels
     ]
     max_label_lines = max(len(lines) for lines in label_lines)
-    title_height = len(title_lines) * 40
-    desc_height = len(desc_lines) * 25 + 12 if desc_lines else 0
-    top = 26 + title_height + desc_height
-    bottom = max_label_lines * 21 + 10 + (26 if foot_lines else 14)
-    height = top + _PLOT_HEIGHT + bottom
+    top, bottom, height = _layout_geometry(
+        title_lines, desc_lines, foot_lines, max_label_lines
+    )
     return _ChartLayout(
         width=width,
         left_margin=left_margin,
@@ -345,7 +421,12 @@ def _chart_values(
     data: list[dict[str, object]],
     series: list[dict[str, object]],
 ) -> tuple[list[list[float]], float]:
-    """Extract per-series float rows and the overall maximum."""
+    """Extract per-series float rows and the overall maximum.
+
+    Returns:
+        Tuple of the per-series float rows and the overall maximum value.
+
+    """
     values: list[list[float]] = []
     vmax = 0.0
     for row_data in data:
@@ -384,7 +465,12 @@ class _ChartRenderer:
         self._draw = ImageDraw.Draw(self._img)
 
     def render(self) -> bytes:
-        """Draw every chart element, returning PNG image bytes."""
+        """Draw every chart element, returning PNG image bytes.
+
+        Returns:
+            The rendered chart as PNG-encoded bytes.
+
+        """
         self._draw_header()
         self._draw_grid()
         self._draw_bars()
@@ -394,7 +480,12 @@ class _ChartRenderer:
         return out.getvalue()
 
     def _value_y(self, value: float) -> int:
-        """Map a data value to its vertical pixel position."""
+        """Map a data value to its vertical pixel position.
+
+        Returns:
+            The y pixel coordinate for the value.
+
+        """
         ratio = value / self._nice_max
         return int(self._plot_bottom - ratio * self._plot_height)
 
@@ -457,8 +548,6 @@ class _ChartRenderer:
     def _draw_bars(self) -> None:
         """Draw grouped bars with value tags, x labels, and the legend."""
         layout = self._layout
-        fonts = self._fonts
-        draw = self._draw
         n_groups = len(self._values)
         n_series = max(len(self._series), 1)
         slot = layout.plot_width / n_groups
@@ -468,50 +557,78 @@ class _ChartRenderer:
             zip(layout.labels, self._values, strict=True)
         ):
             group_x = layout.left_margin + gi * slot + (slot - bar_w * n_series) / 2
-            for si, value in enumerate(row):
-                x0 = group_x + si * bar_w
-                bar_h = max(self._plot_bottom - self._value_y(value), 2)
-                draw.rectangle(
-                    [x0, self._plot_bottom - bar_h, x0 + bar_w, self._plot_bottom],
-                    fill=colors[si],
-                )
-                tag = _fmt_value(value, self._series_value_format(si))
-                tag_w = draw.textlength(tag, font=fonts.value)
-                tag_y = max(self._plot_bottom - bar_h - 21, 2)
-                draw.text(
-                    (x0 + (bar_w - tag_w) / 2, tag_y),
-                    tag,
-                    font=fonts.value,
-                    fill=_INK,
-                )
-            center_x = layout.left_margin + gi * slot + slot / 2
-            text_y = self._plot_bottom + 8
-            for line in layout.label_lines[gi]:
-                line_w = draw.textlength(line, font=fonts.tick)
-                draw.text(
-                    (center_x - line_w / 2, text_y),
-                    line,
-                    font=fonts.tick,
-                    fill=_X_LABEL_COLOR,
-                )
-                text_y += 21
-        if n_series > 1:
-            legend_y = self._plot_bottom + layout.max_label_lines * 21 + 14
-            legend_x = layout.left_margin
-            for entry, color in zip(self._series, colors, strict=True):
-                draw.rectangle(
-                    [legend_x, legend_y + 3, legend_x + 14, legend_y + 17],
-                    fill=color,
-                )
-                name_raw = entry.get("label") or entry.get("dataKey")
-                name = " ".join(str(name_raw).split())
-                draw.text((legend_x + 20, legend_y), name, font=fonts.tick, fill=_MUTE)
-                legend_x += 34 + draw.textlength(name, font=fonts.tick)
-                if legend_x > layout.width - layout.right_margin - 80:
-                    break
+            self._draw_group_bars(row, group_x, bar_w, colors)
+            self._draw_group_labels(gi, slot)
+        self._draw_legend(colors, n_series)
+
+    def _draw_group_bars(
+        self, row: list[float], group_x: float, bar_w: float, colors: list[str]
+    ) -> None:
+        """Draw one group's bars with their value tags."""
+        draw = self._draw
+        fonts = self._fonts
+        for si, value in enumerate(row):
+            x0 = group_x + si * bar_w
+            bar_h = max(self._plot_bottom - self._value_y(value), 2)
+            draw.rectangle(
+                [x0, self._plot_bottom - bar_h, x0 + bar_w, self._plot_bottom],
+                fill=colors[si],
+            )
+            tag = _fmt_value(value, self._series_value_format(si))
+            tag_w = draw.textlength(tag, font=fonts.value)
+            tag_y = max(self._plot_bottom - bar_h - 21, 2)
+            draw.text(
+                (x0 + (bar_w - tag_w) / 2, tag_y),
+                tag,
+                font=fonts.value,
+                fill=_INK,
+            )
+
+    def _draw_group_labels(self, gi: int, slot: float) -> None:
+        """Draw wrapped x labels for one bar group."""
+        layout = self._layout
+        draw = self._draw
+        fonts = self._fonts
+        center_x = layout.left_margin + gi * slot + slot / 2
+        text_y = self._plot_bottom + 8
+        for line in layout.label_lines[gi]:
+            line_w = draw.textlength(line, font=fonts.tick)
+            draw.text(
+                (center_x - line_w / 2, text_y),
+                line,
+                font=fonts.tick,
+                fill=_X_LABEL_COLOR,
+            )
+            text_y += 21
+
+    def _draw_legend(self, colors: list[str], n_series: int) -> None:
+        """Draw the series color legend below the x labels."""
+        if n_series <= 1:
+            return
+        layout = self._layout
+        draw = self._draw
+        fonts = self._fonts
+        legend_y = self._plot_bottom + layout.max_label_lines * 21 + 14
+        legend_x = layout.left_margin
+        for entry, color in zip(self._series, colors, strict=True):
+            draw.rectangle(
+                [legend_x, legend_y + 3, legend_x + 14, legend_y + 17],
+                fill=color,
+            )
+            name_raw = entry.get("label") or entry.get("dataKey")
+            name = " ".join(str(name_raw).split())
+            draw.text((legend_x + 20, legend_y), name, font=fonts.tick, fill=_MUTE)
+            legend_x += 34 + draw.textlength(name, font=fonts.tick)
+            if legend_x > layout.width - layout.right_margin - 80:
+                break
 
     def _series_value_format(self, index: int) -> str | None:
-        """Return the value format name for one series, if configured."""
+        """Return the value format name for one series, if configured.
+
+        Returns:
+            The configured format name, or None when absent.
+
+        """
         raw = self._series[index].get("valueFormat")
         return raw if isinstance(raw, str) else None
 
@@ -526,5 +643,10 @@ class _ChartRenderer:
 
 
 def render_chart_png(spec: dict[str, object], width: int = 1080) -> bytes:
-    """Render a normalized chart spec to PNG image bytes."""
+    """Render a normalized chart spec to PNG image bytes.
+
+    Returns:
+        The rendered chart as PNG-encoded bytes.
+
+    """
     return _ChartRenderer(_coerce_chart_spec(spec), width).render()

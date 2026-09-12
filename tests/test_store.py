@@ -278,7 +278,12 @@ class TestConversationStoreSqlite(unittest.TestCase):
         assert snap.items[0].images[0].data == LEGACY_DATA
 
     def _insert_prefix_then_fail(self, entry_hash: str, ref: ConvRef) -> None:
-        """Insert one prefix row then raise to trigger a rollback."""
+        """Insert one prefix row then raise to trigger a rollback.
+
+        Raises:
+            _SimulatedTransactionError: Always raised after the insert.
+
+        """
         with self.store.transaction() as conn:
             conn.execute(
                 INSERT_PREFIX_SQL,

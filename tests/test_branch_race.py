@@ -30,8 +30,8 @@ from app.chatgpt import AccountSession
 from app.engine import (
     EngineError,
     TurnResult,
-    _jsx_cite_cut,
-    _render_citations,
+    jsx_cite_cut,
+    render_citations,
     run_turn,
 )
 
@@ -54,33 +54,46 @@ class FakeAccount(AccountSession):
         plan: str = "free",
     ) -> None:
         """Create a replay account serving the given canned events."""
-        super().__init__(
-            {
-                "identity": identity,
-                "session": {
-                    "accessToken": "",
-                    "account": {"planType": plan},
-                    "user": {"email": email},
-                },
-                "cookies": {},
-            }
-        )
+        super().__init__({
+            "identity": identity,
+            "session": {
+                "accessToken": "",
+                "account": {"planType": plan},
+                "user": {"email": email},
+            },
+            "cookies": {},
+        })
         self._events = events
 
     @override
     async def models(self) -> list[dict[str, str]]:
-        """Return the canned single-model listing."""
+        """Return the canned single-model listing.
+
+        Returns:
+            The single-entry model list with slug ``auto``.
+
+        """
         return [{"slug": "auto"}]
 
     @override
     async def stream_conversation(self, **_kwargs: object) -> AsyncIterator[SSEEvent]:
-        """Replay the canned SSE events."""
+        """Replay the canned SSE events.
+
+        Yields:
+            Each canned SSE event in order.
+
+        """
         for event in self._events:
             yield event
 
 
 def _make_request() -> ParsedRequest:
-    """Build the single-turn user request shared by every test here."""
+    """Build the single-turn user request shared by every test here.
+
+    Returns:
+        A single-turn user request for ``auto`` with streaming disabled.
+
+    """
     return ParsedRequest(
         system_text="",
         items=[HistoryItem(role="user", text="q")],
@@ -90,7 +103,12 @@ def _make_request() -> ParsedRequest:
 
 
 async def _stream_turn(pool: AccountPool) -> tuple[list[str], TurnResult | None]:
-    """Run one turn, returning streamed bytes and the completion result."""
+    """Run one turn, returning streamed bytes and the completion result.
+
+    Returns:
+        A tuple of streamed delta texts and the completion result, if any.
+
+    """
     deltas: list[str] = []
     result: TurnResult | None = None
     async for event in run_turn(_make_request(), pool):
@@ -106,7 +124,12 @@ async def _stream_turn(pool: AccountPool) -> tuple[list[str], TurnResult | None]
 
 
 async def _drain_partial(pool: AccountPool) -> tuple[list[str], EngineError]:
-    """Drain a failing turn, returning partial bytes and the failure."""
+    """Drain a failing turn, returning partial bytes and the failure.
+
+    Returns:
+        A tuple of partial delta texts and the engine failure.
+
+    """
     deltas: list[str] = []
     try:
         async for event in run_turn(_make_request(), pool):
@@ -123,7 +146,12 @@ async def _drain_partial(pool: AccountPool) -> tuple[list[str], EngineError]:
 def _msg(
     mid: str, role: str, ctype: str, parts: list[str] | None, mtype: str | None = None
 ) -> SSEEvent:
-    """Build one SSE node for the canned race stream."""
+    """Build one SSE node for the canned race stream.
+
+    Returns:
+        One SSE event dict carrying the given message node.
+
+    """
     md: SSEEvent = {"message_type": mtype} if mtype else {}
     return {
         "message": {
@@ -137,7 +165,12 @@ def _msg(
 
 
 def _user_then(events_tail: list[SSEEvent]) -> list[SSEEvent]:
-    """Prepend the shared user turn to a canned assistant event tail."""
+    """Prepend the shared user turn to a canned assistant event tail.
+
+    Returns:
+        The user turn followed by the given assistant events.
+
+    """
     return [
         {
             "message": {
@@ -184,7 +217,8 @@ RACE_EVENTS = _user_then(
 class TestConcurrentGenerationBranchRace(unittest.TestCase):
     """Regression tests for interleaved generation branches in one turn."""
 
-    def test_interleaved_generations_stream_one_answer(self) -> None:
+    @staticmethod
+    def test_interleaved_generations_stream_one_answer() -> None:
         """Stream one answer when upstream interleaves rival branches."""
         pool = AccountPool()
         pool.register(FakeAccount("a", "a@example.com", RACE_EVENTS))
@@ -204,7 +238,8 @@ class TestConcurrentGenerationBranchRace(unittest.TestCase):
             "the conversation parent away from the streamed branch"
         )
 
-    def test_idless_streamed_branch_without_completion_fails_over(self) -> None:
+    @staticmethod
+    def test_idless_streamed_branch_without_completion_fails_over() -> None:
         """Fail over when the streamed branch never completes.
 
         A text node without an id streams (emission gate's not-m["id"] arm,
@@ -241,59 +276,65 @@ class TestConcurrentGenerationBranchRace(unittest.TestCase):
 class TestJsxCitations(unittest.TestCase):
     """Unit tests for JSX citation rendering and stream withholding."""
 
-    def test_unresolved_tag_holds_then_drops_at_final(self) -> None:
+    @staticmethod
+    def test_unresolved_tag_holds_then_drops_at_final() -> None:
         """Hold unresolved tags mid-stream, then drop them at final."""
         raw = 'Answer. <Cite refs={["turn0news9","turn0search10"]}/> Tail.'
-        text, safe = _render_citations(raw, {})
+        text, safe = render_citations(raw, {})
         assert safe == len("Answer. "), "unresolved tokens must hold the stream"
         assert not text[:safe].endswith("<Cite")
-        final, _ = _render_citations(raw, {}, final=True)
+        final, _ = render_citations(raw, {}, final=True)
         assert "<Cite" not in final
         assert "Answer." in final
         assert "Tail." in final
 
-    def test_half_received_tag_withheld_mid_stream(self) -> None:
+    @staticmethod
+    def test_half_received_tag_withheld_mid_stream() -> None:
         """Withhold a half-received tag mid-stream, then drop it."""
         raw = 'Answer. <Cite ref={["turn0search1'
-        text, safe = _render_citations(raw, {})
+        text, safe = render_citations(raw, {})
         assert text[:safe] == "Answer. "
-        assert _jsx_cite_cut(raw) == len("Answer. ")
-        final, _ = _render_citations(raw, {}, final=True)
+        assert jsx_cite_cut(raw) == len("Answer. ")
+        final, _ = render_citations(raw, {}, final=True)
         assert final == "Answer. "
 
-    def test_resolved_tokens_render_links(self) -> None:
+    @staticmethod
+    def test_resolved_tokens_render_links() -> None:
         """Render resolved citation tokens as markdown links."""
         cmap = {(0, "search", 1): {"title": "NIDCD", "url": "https://x.gov/a"}}
         raw = 'A. <Cite refs={["turn0search1"]}/> B.'
-        text, safe = _render_citations(raw, cmap)
+        text, safe = render_citations(raw, cmap)
         assert "[NIDCD](https://x.gov/a)" in text
         assert safe == len(text)
 
-    def test_token_free_tag_is_code_not_citation(self) -> None:
+    @staticmethod
+    def test_token_free_tag_is_code_not_citation() -> None:
         """Keep token-free tags verbatim as code, not citations."""
         raw = "return <Cite Foo bar/> from the component"
-        text, _ = _render_citations(raw, {}, final=True)
+        text, _ = render_citations(raw, {}, final=True)
         assert text == raw
 
-    def test_long_token_free_fragment_withheld_then_kept(self) -> None:
+    @staticmethod
+    def test_long_token_free_fragment_withheld_then_kept() -> None:
         """Withhold a long unclosed fragment mid-stream, keep it at final."""
         raw = "x = <Cite" + " a" * 80  # token-free, >120 chars, unclosed
-        text, safe = _render_citations(raw, {})
+        text, safe = render_citations(raw, {})
         assert text[:safe] == "x = ", (
             "any unclosed single-line fragment must be withheld "
             "mid-stream: it could still complete into a tag"
         )
-        final, _ = _render_citations(raw, {}, final=True)
+        final, _ = render_citations(raw, {}, final=True)
         assert final == raw, (
             "a token-free >120-char fragment is code content and "
             "must survive the final flush"
         )
 
-    def test_multiline_cite_mention_is_not_treated_as_tag(self) -> None:
+    @staticmethod
+    def test_multiline_cite_mention_is_not_treated_as_tag() -> None:
         """Treat a multiline cite mention as prose, not a tag."""
         raw = "see <Cite\n  for details"
-        assert _jsx_cite_cut(raw) == NO_WITHHOLD
-        text, _ = _render_citations(raw, {}, final=True)
+        assert jsx_cite_cut(raw) == NO_WITHHOLD
+        text, _ = render_citations(raw, {}, final=True)
         assert "<Cite" in text
 
 

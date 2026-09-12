@@ -158,6 +158,10 @@ def _refusal_next_words(starter: str) -> tuple[str, ...] | None:
     """Next words that can still grow into a refusal.
 
     Any other word proves a normal reply and releases the stream immediately.
+
+    Returns:
+        Allowed next words for the starter, or None when no gate is known.
+
     """
     if starter.startswith("log in to "):
         return ("images",)  # "log in to generate/create/edit images"
@@ -179,7 +183,12 @@ def _refusal_next_words(starter: str) -> tuple[str, ...] | None:
 
 
 def _starter_remainder(stripped: str, starter: str) -> str | None:
-    """Remainder after a starter, or None when diverged, or "" when held."""
+    """Remainder after a starter, or None when diverged, or "" when held.
+
+    Returns:
+        The text after the starter, an empty string while held, or None when diverged.
+
+    """
     if not stripped or not stripped.startswith(starter[:1]):
         return None
     common = min(len(stripped), len(starter))
@@ -192,7 +201,12 @@ def _starter_remainder(stripped: str, starter: str) -> str | None:
 
 
 def _classify_quota_rest(rest: str, text_len: int) -> tuple[int, bool]:
-    """Classify text following a quota starter."""
+    """Classify text following a quota starter.
+
+    Returns:
+        The (safe length, refusal flag) pair for text after a quota starter.
+
+    """
     match = re.match(r"[a-z]+", rest)
     word = match.group(0) if match else ""
     if not word:
@@ -204,7 +218,12 @@ def _classify_quota_rest(rest: str, text_len: int) -> tuple[int, bool]:
 
 
 def _classify_gated_rest(starter: str, rest: str, text_len: int) -> tuple[int, bool]:
-    """Classify text following a gated non-quota starter."""
+    """Classify text following a gated non-quota starter.
+
+    Returns:
+        The (safe length, refusal flag) pair for text after a gated starter.
+
+    """
     allowed = _refusal_next_words(starter)
     if allowed is None:
         return 0, False
@@ -222,7 +241,12 @@ def _classify_gated_rest(starter: str, rest: str, text_len: int) -> tuple[int, b
 
 
 def _classify_starter_match(starter: str, rest: str, text_len: int) -> tuple[int, bool]:
-    """Classify text that fully matched a starter plus trailing text."""
+    """Classify text that fully matched a starter plus trailing text.
+
+    Returns:
+        The (safe length, refusal flag) pair for a matched starter plus trailing text.
+
+    """
     if starter.startswith(("you've hit", "you have hit")):
         return _classify_quota_rest(rest, text_len)
     return _classify_gated_rest(starter, rest, text_len)
@@ -240,6 +264,10 @@ def _classify_accumulated(text: str) -> tuple[int, bool]:
     could still grow into the quota refusal, nothing is released; the moment
     it diverges from every refusal opening (or exceeds plausible length), the
     whole buffer is released so normal streaming is never visibly delayed.
+
+    Returns:
+        The (safe length, refusal flag) pair for the buffered assistant text.
+
     """
     if IMAGE_LIMIT_RE.search(text):
         return 0, True
@@ -269,7 +297,7 @@ def _classify_accumulated(text: str) -> tuple[int, bool]:
 # a block whose sources have not arrived yet is withheld until it resolves,
 # and dropped at end of turn if its sources never show up. URLs lose utm_*
 # tracking parameters so clients see clean links.
-_CITE_BLOCK_RE = re.compile("\ue200cite(?:\ue202turn\\d+[a-z]+\\d+)+\ue201")
+_CITE_BLOCK_RE = re.compile(r"\ue200cite(?:\ue202turn\d+[a-z]+\d+)+\ue201")
 _CITE_TOKEN_RE = re.compile(r"turn(\d+)([a-z]+)(\d+)")
 # Non-citation rich-content widgets ride the same \ue200..\ue201 delimiters:
 #   "\ue200navlist\ue202<title>\ue202turn0news1...\ue201"   -- UI nav chips
@@ -280,24 +308,24 @@ _CITE_TOKEN_RE = re.compile(r"turn(\d+)([a-z]+)(\d+)")
 # Entity/product cards carry visible content and must not be stripped.
 #   "\ue200entity\ue202["product","Microsoft...", "Model 1067"]\ue201"
 # Product references render as titled markdown links when possible.
-_ENTITY_BLOCK_RE = re.compile("\\ue200entity\\ue202([^\\ue201]*?)\\ue201")
+_ENTITY_BLOCK_RE = re.compile(r"\ue200entity\ue202([^\ue201]*?)\ue201")
 # Inline link widgets carry a VISIBLE title plus a ref token or raw URL:
 #   "\ue200url\ue202Oh My Pi SDK Docs\ue202turn0search0\ue201" (via cite_map)
 #   "\ue200video\ue202Eternity scene\ue202turn0youtube12\ue201" (via cite_map)
 #   "\ue200url\ue202Bitwarden\ue202https://bitwarden.com\ue201" (raw URL)
 # Stripping them leaves dangling "- " bullets / "label: " lines with no link.
 _LINK_BLOCK_RE = re.compile(
-    "\\ue200(?:url|video)\\ue202([^\\ue201]*?)(?:\\ue202([^\\ue201]*?))?\\ue201",
+    r"\ue200(?:url|video)\ue202([^\ue201]*?)(?:\ue202([^\ue201]*?))?\ue201",
 )
-_PRODUCTS_BLOCK_RE = re.compile("\\ue200products\\ue202([^\\ue201]*?)\\ue201")
+_PRODUCTS_BLOCK_RE = re.compile(r"\ue200products\ue202([^\ue201]*?)\ue201")
 # The rest duplicate what the surrounding prose/links/table already say, so
 # they are stripped outright. The [a-z_]+ arm catches ANY other named widget
 # generically (payload after an optional \ue202 separator), so new kinds
 # degrade to stripped instead of leaking; well-formed cite/entity/link/product
 # blocks are excluded so all five regexes can be merged positionally.
 _WIDGET_BLOCK_RE = re.compile(
-    "\\ue200(?!cite\\ue202turn)(?!entity\\ue202)(?!url\\ue202)(?!video\\ue202)(?!products\\ue202)"
-    "(?:navlist|[a-z_]+)(?:\\ue202[^\\ue201]*?)?\\ue201",
+    r"\ue200(?!cite\ue202turn)(?!entity\ue202)(?!url\ue202)(?!video\ue202)(?!products\ue202)"
+    r"(?:navlist|[a-z_]+)(?:\ue202[^\ue201]*?)?\ue201",
 )
 # The concurrent-generation stream variant serializes citations as JSX
 # instead of \ue200 blocks:  <Cite refs={["turn0news9","turn0search10"]}/>
@@ -306,12 +334,17 @@ _WIDGET_BLOCK_RE = re.compile(
 # same cite_map as PUA cite blocks; a token-free match is legit code content
 # and must stay untouched.
 _CITE_TAG_RE = re.compile(r"<Cite\b[^>\n]*?/>")
-_PUA_CHARS_RE = re.compile("[\\ue200-\\ue205]")
+_PUA_CHARS_RE = re.compile(r"[\ue200-\ue205]")
 _GENUI_PREFIX = "\ue200genui"
 
 
 def _opt_str(value: object) -> str:
-    """Coerce a JSON field to text."""
+    """Coerce a JSON field to text.
+
+    Returns:
+        The value unchanged when a string, an empty string when falsy, else str(value).
+
+    """
     if isinstance(value, str):
         return value
     if not value:
@@ -320,14 +353,24 @@ def _opt_str(value: object) -> str:
 
 
 def _as_object_list(value: object) -> list[object]:
-    """Return value items when it is a list, otherwise an empty list."""
+    """Return value items when it is a list, otherwise an empty list.
+
+    Returns:
+        A shallow copy of the value when it is a list, else an empty list.
+
+    """
     if not isinstance(value, list):
         return []
     return list(value)
 
 
 def _make_source(url: object, title: object, attr: object) -> CiteSource:
-    """Build a citation source with text-only fields."""
+    """Build a citation source with text-only fields.
+
+    Returns:
+        A citation source dict with url, title, and attr text fields.
+
+    """
     return {"url": _opt_str(url), "title": _opt_str(title), "attr": _opt_str(attr)}
 
 
@@ -386,7 +429,12 @@ def _extend_webpage_item(cmap: CiteMap, item: object) -> None:
 
 
 def _product_keys(product: object, refs: list[object], index: int) -> list[CiteKey]:
-    """Citation keys addressed by one products-carousel entry."""
+    """Citation keys addressed by one products-carousel entry.
+
+    Returns:
+        The citation keys from the product cite token and its positional ref.
+
+    """
     keys: list[CiteKey] = []
     cite: object = None
     if isinstance(product, dict):
@@ -464,7 +512,12 @@ def _cite_map_extend(cmap: CiteMap, meta: object) -> None:
 
 
 def _product_search_url(title: str) -> str:
-    """Return an actionable shopping search when ChatGPT has no product URL."""
+    """Return an actionable shopping search when ChatGPT has no product URL.
+
+    Returns:
+        A Google Shopping search URL for the title, or an empty string when blank.
+
+    """
     query = " ".join(str(title or "").split()).strip()
     if not query:
         return ""
@@ -473,7 +526,12 @@ def _product_search_url(title: str) -> str:
 
 
 def _cite_key(token: object) -> CiteKey | None:
-    """Citation key for a ref token, or None when the token is not a ref."""
+    """Citation key for a ref token, or None when the token is not a ref.
+
+    Returns:
+        The (turn, ref type, ref index) key, or None for non-ref tokens.
+
+    """
     if isinstance(token, dict):
         turn = token.get("turn_index")
         ref_type = token.get("ref_type")
@@ -498,7 +556,12 @@ def _cite_key(token: object) -> CiteKey | None:
 
 
 def _product_source(product: object) -> CiteSource | None:
-    """Normalize a ChatGPT product reference into a citation source."""
+    """Normalize a ChatGPT product reference into a citation source.
+
+    Returns:
+        A citation source for the product, or None when it has no title.
+
+    """
     if not isinstance(product, dict):
         return None
     title = " ".join(_opt_str(product.get("title")).split())
@@ -517,7 +580,12 @@ def _product_source(product: object) -> CiteSource | None:
 
 
 def _product_link(label: str, cmap: CiteMap, token: object = None) -> str:
-    """Render one product as a link, with a search fallback for empty URLs."""
+    """Render one product as a link, with a search fallback for empty URLs.
+
+    Returns:
+        A markdown link for the product, or the bare title with no URL.
+
+    """
     source: CiteSource | None = None
     if token is not None:
         key = _cite_key(token)
@@ -532,7 +600,12 @@ def _product_link(label: str, cmap: CiteMap, token: object = None) -> str:
 
 
 def _selections_from_payload(payload: str) -> list[object]:
-    """Product selections list from a carousel payload, or empty."""
+    """Product selections list from a carousel payload, or empty.
+
+    Returns:
+        The selections list from the payload, or an empty list when not JSON.
+
+    """
     try:
         parsed: object = json.loads(payload)
     except ValueError:
@@ -545,7 +618,12 @@ def _selections_from_payload(payload: str) -> list[object]:
 
 
 def _format_products(payload: str, cmap: CiteMap) -> str:
-    """Render a products carousel as compact markdown links."""
+    """Render a products carousel as compact markdown links.
+
+    Returns:
+        The selections rendered as markdown links joined with middle dots.
+
+    """
     selections = _selections_from_payload(payload)
     links: list[str] = []
     for selection in selections:
@@ -559,7 +637,12 @@ def _format_products(payload: str, cmap: CiteMap) -> str:
 
 
 def _products_unresolved(payload: str, cmap: CiteMap) -> bool:
-    """Whether a products carousel references sources not yet in the map."""
+    """Whether a products carousel references sources not yet in the map.
+
+    Returns:
+        True when a selection references a key missing from the map.
+
+    """
     selections = _selections_from_payload(payload)
     for selection in selections:
         if not isinstance(selection, list):
@@ -573,7 +656,12 @@ def _products_unresolved(payload: str, cmap: CiteMap) -> bool:
 
 
 def _clean_url(url: str) -> str:
-    """Drop utm_* tracking parameters; keep everything else byte-faithful."""
+    """Drop utm_* tracking parameters; keep everything else byte-faithful.
+
+    Returns:
+        The URL without utm_* parameters, or an empty string when unusable.
+
+    """
     # Split the raw query instead of round-tripping through parse_qsl:
     # re-encoding survivors corrupts values (semicolon pairs collapse,
     # invalid-UTF-8 escapes get replaced, %20 becomes '+').
@@ -585,13 +673,14 @@ def _clean_url(url: str) -> str:
         parts = urllib.parse.urlsplit(url.strip())
     except ValueError:
         return ""
-    if parts.scheme.lower() not in ("http", "https") or not parts.netloc:
+    if parts.scheme.lower() not in {"http", "https"} or not parts.netloc:
         return ""
     kept = (
         [
             pair
             for pair in parts.query.split("&")
-            if not urllib.parse.unquote_plus(pair.partition("=")[0])
+            if not urllib.parse
+            .unquote_plus(pair.partition("=")[0])
             .lower()
             .startswith("utm_")
         ]
@@ -604,7 +693,12 @@ def _clean_url(url: str) -> str:
 
 
 def _format_source(src: CiteSource) -> str:
-    """One citation as [label](url); label falls back to attribution/domain."""
+    """One citation as [label](url); label falls back to attribution/domain.
+
+    Returns:
+        One citation as a markdown link, bare label, or bare URL.
+
+    """
     if not isinstance(src, dict):
         return ""
     url = _clean_url(src.get("url", ""))
@@ -624,7 +718,12 @@ SOURCE_APPENDIX_MAX = 50
 
 
 def _host_of(url: str) -> str:
-    """Host of a URL, lowercased, or empty when unparsable."""
+    """Host of a URL, lowercased, or empty when unparsable.
+
+    Returns:
+        The lowercased URL host, or an empty string when unparsable.
+
+    """
     try:
         return (urllib.parse.urlsplit(url).netloc or "").lower()
     except ValueError:
@@ -632,7 +731,12 @@ def _host_of(url: str) -> str:
 
 
 def _appendix_title(src: CiteSource, url: str) -> str:
-    """Display title for one appendix entry."""
+    """Display title for one appendix entry.
+
+    Returns:
+        The title, attribution, host, or URL fallback for one entry.
+
+    """
     title = " ".join(_opt_str(src.get("title")).split())
     title = title.replace("[", "(").replace("]", ")")
     if not title:
@@ -644,7 +748,12 @@ def _appendix_title(src: CiteSource, url: str) -> str:
 
 
 def _appendix_entry(url: str, title: str, clean_query: str) -> str:
-    """One appendix line for an already-cleaned URL and title."""
+    """One appendix line for an already-cleaned URL and title.
+
+    Returns:
+        One appendix line for the cleaned URL, title, and query.
+
+    """
     entry = f"[{title}]({url})"
     host = _host_of(url)
     if title != url and host:
@@ -663,6 +772,10 @@ def _source_appendix(sources: list[CiteSource], query: str = "") -> str:
 
         Search Queries
         1. `query`
+
+    Returns:
+        The Sources/Search Queries block, or an empty string with no entries.
+
     """
     clean_query = query.replace("`", "'").strip() if query else ""
     entries: list[str] = []
@@ -684,16 +797,19 @@ def _source_appendix(sources: list[CiteSource], query: str = "") -> str:
     lines = ["Sources"]
     lines.extend(f"{num}. {entry}" for num, entry in enumerate(entries, start=1))
     if clean_query:
-        lines.append("")
-        lines.append("Search Queries")
-        lines.append(f"1. `{clean_query}`")
+        lines.extend(["", "Search Queries", f"1. `{clean_query}`"])
     return "\n\n" + "\n".join(lines)
 
 
 def _entity_from_list(
     parsed: object,
 ) -> tuple[str, object, CiteKey | None, bool] | None:
-    """Parse a list-form entity widget."""
+    """Parse a list-form entity widget.
+
+    Returns:
+        The (label, token, key, is-product) tuple, or None when unparsable.
+
+    """
     if not isinstance(parsed, list):
         return None
     token: object = parsed[0] if parsed and isinstance(parsed[0], str) else None
@@ -713,7 +829,12 @@ def _entity_from_list(
 def _entity_from_dict(
     entity: object,
 ) -> tuple[str, object, CiteKey | None, bool] | None:
-    """Parse a dict-form entity widget."""
+    """Parse a dict-form entity widget.
+
+    Returns:
+        The (label, token, key, is-product) tuple, or None when unparsable.
+
+    """
     if not isinstance(entity, dict):
         return None
     token: object = entity.get("cite") or entity.get("ref_id")
@@ -731,7 +852,12 @@ def _entity_from_dict(
 def _parse_entity(
     payload: str,
 ) -> tuple[str, object, CiteKey | None, bool] | None:
-    """Return (label, token, citation key, is_product) for one entity widget."""
+    """Return (label, token, citation key, is_product) for one entity widget.
+
+    Returns:
+        The (label, token, key, is-product) tuple, or None for non-JSON payloads.
+
+    """
     try:
         parsed: object = json.loads(payload.split("\ue202", maxsplit=1)[0])
     except ValueError:
@@ -744,7 +870,12 @@ def _parse_entity(
 
 
 def _format_entity(payload: str, cmap: CiteMap) -> str:
-    """Render an entity; product entities retain an actionable markdown link."""
+    """Render an entity; product entities retain an actionable markdown link.
+
+    Returns:
+        The entity label, linked when a product, or an empty string when unparsable.
+
+    """
     parsed = _parse_entity(payload)
     if parsed is None:
         return ""
@@ -752,7 +883,7 @@ def _format_entity(payload: str, cmap: CiteMap) -> str:
     return _product_link(label, cmap, token) if is_product else label
 
 
-def _jsx_cite_cut(raw: str, *, final: bool = False) -> int:
+def jsx_cite_cut(raw: str, *, final: bool = False) -> int:
     """Start index of a trailing unclosed fragment worth withholding.
 
     A half-streamed citation tag (<Cite ref={["turn0search1) must
@@ -762,6 +893,10 @@ def _jsx_cite_cut(raw: str, *, final: bool = False) -> int:
     bytes emitted now could never match the re-rendered prefix. At final the
     token/120 gates decide keep-vs-drop: multi-line or token-free <Cite
     occurrences are code content and stay untouched.
+
+    Returns:
+        The index of the trailing unclosed fragment, or -1 when nothing is withheld.
+
     """
     p = raw.rfind("<Cite")
     if p < 0:
@@ -775,7 +910,12 @@ def _jsx_cite_cut(raw: str, *, final: bool = False) -> int:
 
 
 def _cite_tag_piece(block: str, cmap: CiteMap, *, final: bool) -> tuple[str, bool]:
-    """Render one JSX cite tag; bool flags a mid-stream hold."""
+    """Render one JSX cite tag; bool flags a mid-stream hold.
+
+    Returns:
+        The (rendered text, hold flag) pair for one JSX cite tag.
+
+    """
     tokens = _CITE_TOKEN_RE.findall(block)
     sources = [cmap.get((int(t), rt, int(n))) for t, rt, n in tokens]
     resolved = [s for s in sources if s is not None]
@@ -787,7 +927,12 @@ def _cite_tag_piece(block: str, cmap: CiteMap, *, final: bool) -> tuple[str, boo
 
 
 def _cite_block_piece(block: str, cmap: CiteMap, *, final: bool) -> tuple[str, bool]:
-    """Render one PUA cite block; bool flags a mid-stream hold."""
+    """Render one PUA cite block; bool flags a mid-stream hold.
+
+    Returns:
+        The (rendered text, hold flag) pair for one PUA cite block.
+
+    """
     tokens = _CITE_TOKEN_RE.findall(block)
     sources = [cmap.get((int(t), rt, int(n))) for t, rt, n in tokens]
     resolved = [s for s in sources if s is not None]
@@ -797,14 +942,24 @@ def _cite_block_piece(block: str, cmap: CiteMap, *, final: bool) -> tuple[str, b
 
 
 def _products_piece(payload: str, cmap: CiteMap, *, final: bool) -> tuple[str, bool]:
-    """Render one products block; bool flags a mid-stream hold."""
+    """Render one products block; bool flags a mid-stream hold.
+
+    Returns:
+        The (rendered text, hold flag) pair for one products block.
+
+    """
     if not final and _products_unresolved(payload, cmap):
         return "", True
     return _format_products(payload, cmap), False
 
 
 def _entity_piece(payload: str, cmap: CiteMap, *, final: bool) -> tuple[str, bool]:
-    """Render one entity block; bool flags a mid-stream hold."""
+    """Render one entity block; bool flags a mid-stream hold.
+
+    Returns:
+        The (rendered text, hold flag) pair for one entity block.
+
+    """
     parsed = _parse_entity(payload)
     if parsed is None or final:
         return _format_entity(payload, cmap), False
@@ -817,7 +972,12 @@ def _entity_piece(payload: str, cmap: CiteMap, *, final: bool) -> tuple[str, boo
 def _link_ref_piece(
     title: str, target: str, cmap: CiteMap, *, final: bool
 ) -> tuple[str, bool]:
-    """Render a ref-target link widget."""
+    """Render a ref-target link widget.
+
+    Returns:
+        The (rendered text, hold flag) pair for one ref-target link.
+
+    """
     match = _CITE_TOKEN_RE.fullmatch(target)
     if match is None:
         return title, False
@@ -839,7 +999,12 @@ def _link_ref_piece(
 def _link_piece(
     raw_title: object, raw_target: object, cmap: CiteMap, *, final: bool
 ) -> tuple[str, bool]:
-    """Render one url/video widget; bool flags a mid-stream hold."""
+    """Render one url/video widget; bool flags a mid-stream hold.
+
+    Returns:
+        The (rendered text, hold flag) pair for one url/video widget.
+
+    """
     title = " ".join(_opt_str(raw_title).split()).replace("[", "(").replace("]", ")")
     target = _opt_str(raw_target).strip()
     if _CITE_TOKEN_RE.fullmatch(target) is not None:
@@ -873,7 +1038,12 @@ def _collect_chart(block: str, charts_out: list[ChartSpec] | None) -> None:
 
 
 def _collect_matches(raw: str) -> list[re.Match[str]]:
-    """All widget/citation matches in positional order."""
+    """All widget/citation matches in positional order.
+
+    Returns:
+        Every widget and citation match in positional order.
+
+    """
     patterns = (
         _CITE_BLOCK_RE,
         _CITE_TAG_RE,
@@ -889,7 +1059,7 @@ def _collect_matches(raw: str) -> list[re.Match[str]]:
     return found
 
 
-def _render_citations(
+def render_citations(
     raw: str,
     cmap: CiteMap,
     *,
@@ -905,13 +1075,17 @@ def _render_citations(
     is over -- unresolved tokens are dropped instead of held. When charts_out
     is a list (final pass), genui chart specs are collected into it for the
     caller to render and upload.
+
+    Returns:
+        The (rendered text, safe length) pair for the text snapshot.
+
     """
     out: list[str] = []
     pos = 0
     safe = 0
     hold = -1
     if not final:
-        cut = _jsx_cite_cut(raw)
+        cut = jsx_cite_cut(raw)
         if cut >= 0:
             raw = raw[:cut]
     matches = _collect_matches(raw)
@@ -943,7 +1117,12 @@ def _render_match(
     *,
     final: bool,
 ) -> tuple[str, bool]:
-    """Render one citation/widget match; bool flags a mid-stream hold."""
+    """Render one citation/widget match; bool flags a mid-stream hold.
+
+    Returns:
+        The (rendered text, hold flag) pair for one citation or widget match.
+
+    """
     text = match.group(0)
     if match.re is _CITE_TAG_RE:
         return _cite_tag_piece(text, cmap, final=final)
@@ -963,7 +1142,12 @@ def _render_match(
 def _append_tail(
     out: list[str], tail: str, safe: int, hold: int, *, final: bool
 ) -> tuple[int, int]:
-    """Append trailing text, withholding a half-received marker mid-stream."""
+    """Append trailing text, withholding a half-received marker mid-stream.
+
+    Returns:
+        The updated (safe, hold) pair after appending the trailing text.
+
+    """
     cut = -1 if hold >= 0 or final else tail.find("\ue200")
     if cut >= 0:
         out.append(tail[:cut])
@@ -978,8 +1162,13 @@ def _append_tail(
 
 
 def _finalize_text(text: str) -> tuple[str, int]:
-    """Strip leftover marker scaffolding at end of stream."""
-    cut = _jsx_cite_cut(text, final=True)
+    """Strip leftover marker scaffolding at end of stream.
+
+    Returns:
+        The (stripped text, final length) pair with scaffolding removed.
+
+    """
+    cut = jsx_cite_cut(text, final=True)
     if cut >= 0:
         text = text[:cut]
     text = _PUA_CHARS_RE.sub("", text)
@@ -1001,6 +1190,13 @@ async def _upload_inputs(
     before it are replayed history: an image that no longer opens (e.g. an
     expired remote URL re-fetched at parse time) is skipped with a warning
     instead of turning a servable conversation into a hard 400.
+
+    Returns:
+        The (image pointers, attachments) pair uploaded to this account.
+
+    Raises:
+        EngineError: If a strict image is unsupported or corrupt.
+
     """
     pointers: list[JsonObject] = []
     attachments: list[JsonObject] = []
@@ -1045,7 +1241,12 @@ async def _upload_inputs(
 
 
 def _history_hashes(items: list[HistoryItem], system_text: str) -> list[str]:
-    """Hash chain for prefix matching stored conversations."""
+    """Hash chain for prefix matching stored conversations.
+
+    Returns:
+        The per-turn hash chain for prefix-matching stored conversations.
+
+    """
     prev = item_hash("", "system", system_text) if system_text else ""
     out: list[str] = []
     for item in items:
@@ -1061,6 +1262,13 @@ async def _resolve_images(acct: AccountSession, pointers: list[str]) -> list[str
     returning an empty list: the caller would otherwise record an empty
     successful turn and the client would see a silent blank reply for an
     image that ChatGPT actually generated.
+
+    Returns:
+        The freeimage.host URLs for the resolved generated images.
+
+    Raises:
+        EngineError: If images were generated but none could be delivered.
+
     """
     urls: list[str] = []
     wanted = 0
@@ -1094,6 +1302,10 @@ def _replay_prompt(system_text: str, items: list[HistoryItem]) -> str:
     Preserves every turn on a non-owner account. Text-like files were already
     fenced into their turn's text at parse time; images/binary files attach
     separately.
+
+    Returns:
+        The whole transcript rendered as [role] blocks for a fresh conversation.
+
     """
     blocks: list[str] = []
     if system_text:
@@ -1112,6 +1324,10 @@ def _chain_context(
     Clients of previous_response_id flows usually send only NEW items per call;
     if instead they resent the full history (hash chain extends the snapshot's),
     the request alone is already complete.
+
+    Returns:
+        The (system text, history items) pair merging recorded context with new turns.
+
     """
     base_hashes = _history_hashes(prev_snap.items, prev_snap.system_text)
     client_resent_all = (
@@ -1130,7 +1346,12 @@ def _fallback_context(
     hashes: list[str],
     prev_response_id: str | None,
 ) -> tuple[str, list[HistoryItem]]:
-    """Full context to replay when serving the turn on a non-owner account."""
+    """Full context to replay when serving the turn on a non-owner account.
+
+    Returns:
+        The (system text, history items) pair replayed on a non-owner account.
+
+    """
     ctx_sys, ctx_items = parsed.system_text, parsed.items
     if prev_response_id:
         snap = STORE.get_snapshot(prev_response_id)
@@ -1146,6 +1367,13 @@ def _plan(
     """Decide which stored server conversation to continue.
 
     Returns how much of the request history is new.
+
+    Returns:
+        The (hash chain, conversation ref, matched length) plan for the turn.
+
+    Raises:
+        EngineError: If previous_response_id is unknown or expired.
+
     """
     hashes = _history_hashes(parsed.items, parsed.system_text)
     if previous_response_id:
@@ -1177,19 +1405,34 @@ def _plan(
 
 
 def _raise_policy_error(acct_email: str, err_text: str) -> None:
-    """Raise a moderation rejection before any byte streams."""
+    """Raise a moderation rejection before any byte streams.
+
+    Raises:
+        ChatGPTError: Always raised carrying the moderation rejection.
+
+    """
     message = f"[{acct_email}] ChatGPT rejected this prompt: {err_text[:200]}"
     raise ChatGPTError(502, message)
 
 
 def _raise_image_limit(text: str) -> None:
-    """Raise a per-account image quota refusal."""
+    """Raise a per-account image quota refusal.
+
+    Raises:
+        _ImageLimitError: Always raised carrying the quota refusal text.
+
+    """
     message = text.strip()[:300]
     raise _ImageLimitError(message)
 
 
 def _raise_incomplete(last_event: object) -> None:
-    """Raise when the stream ended without a usable conversation."""
+    """Raise when the stream ended without a usable conversation.
+
+    Raises:
+        EngineError: Always raised describing the incomplete stream.
+
+    """
     tail = "; stream ended without any events"
     if isinstance(last_event, dict) and last_event:
         event_type = _opt_str(last_event.get("type", "?"))
@@ -1199,7 +1442,12 @@ def _raise_incomplete(last_event: object) -> None:
 
 
 def _live_slugs(models: object) -> set[str]:
-    """Live model slugs as a string set."""
+    """Live model slugs as a string set.
+
+    Returns:
+        The live model slugs, or an empty set for non-list input.
+
+    """
     if not isinstance(models, list):
         return set()
     slugs: set[str] = set()
@@ -1215,7 +1463,12 @@ def _live_slugs(models: object) -> set[str]:
 def _failure_for(
     exc: BaseException, acct: AccountSession, pool: AccountPool
 ) -> EngineError:
-    """Map an attempt exception to the failover error."""
+    """Map an attempt exception to the failover error.
+
+    Returns:
+        The EngineError carrying the failover status for the exception.
+
+    """
     if isinstance(exc, _ImageLimitError):
         pool.report_status(acct, HTTP_RATE_LIMITED)
         message = str(exc)
@@ -1238,7 +1491,12 @@ async def _prepare_attempt(
     hashes: list[str],
     previous_response_id: str | None,
 ) -> tuple[str, list[JsonObject], list[JsonObject]]:
-    """Upload inputs and build the prompt for one attempt."""
+    """Upload inputs and build the prompt for one attempt.
+
+    Returns:
+        The (prompt, image pointers, attachments) triple for one attempt.
+
+    """
     current = parsed.items[-1]
     continuing = ref is not None and acct.identity == ref.account_identity
     if continuing or (ref is None and len(parsed.items) == 1):
@@ -1257,7 +1515,12 @@ async def _prepare_attempt(
 
 
 def _is_rival_branch(text_acc: str, parts: list[object]) -> bool:
-    """Whether a new node belongs to a rival concurrent branch."""
+    """Whether a new node belongs to a rival concurrent branch.
+
+    Returns:
+        True when buffered text exists and no part continues it.
+
+    """
     if not text_acc:
         return False
     for part in parts:
@@ -1273,7 +1536,12 @@ def _maybe_adopt_branch(
     text_acc: str,
     parts: list[object],
 ) -> str:
-    """Adopt a new assistant node when it continues the streamed text."""
+    """Adopt a new assistant node when it continues the streamed text.
+
+    Returns:
+        The adopted assistant node id, or the current id for rival nodes.
+
+    """
     if author.get("role") != "assistant":
         return current_msg_id
     node_id = message.get("id")
@@ -1293,7 +1561,12 @@ def _policy_error_text(
     *,
     is_text_node: bool,
 ) -> str | None:
-    """Moderation error text when the node flags is_error, else None."""
+    """Moderation error text when the node flags is_error, else None.
+
+    Returns:
+        The joined moderation error text, or None for non-error nodes.
+
+    """
     if author.get("role") != "assistant" or not is_text_node:
         return None
     metadata = message.get("metadata")
@@ -1310,7 +1583,12 @@ def _is_streamable_part(
     *,
     is_text_node: bool,
 ) -> bool:
-    """Whether a message part carries client-visible streamed prose."""
+    """Whether a message part carries client-visible streamed prose.
+
+    Returns:
+        True for text parts on the currently streamed assistant node.
+
+    """
     if not isinstance(part, str):
         return False
     if author.get("role") != "assistant" or not is_text_node:
@@ -1322,18 +1600,28 @@ def _is_streamable_part(
 def _text_delta(
     text_acc: str, cite_map: CiteMap, emitted: int
 ) -> tuple[str | None, bool]:
-    """Delta to emit for new accumulated text plus limit flag."""
+    """Delta to emit for new accumulated text plus limit flag.
+
+    Returns:
+        The (new delta text or None, image-limit flag) pair for the text.
+
+    """
     emit_upto, is_limit = _classify_accumulated(text_acc)
     if is_limit:
         return None, True
-    display, safe_upto = _render_citations(text_acc, cite_map)
+    display, safe_upto = render_citations(text_acc, cite_map)
     if emit_upto > 0 and safe_upto > emitted:
         return display[emitted:safe_upto], False
     return None, False
 
 
 async def _chart_link_deltas(specs: list[ChartSpec]) -> list[str]:
-    """Rendered chart image links, degrading to stripped on failure."""
+    """Render chart image links, degrading to stripped on failure.
+
+    Returns:
+        The markdown image links for charts that rendered and uploaded.
+
+    """
     links: list[str] = []
     for spec in specs:
         meta = spec.get("meta")
@@ -1360,7 +1648,12 @@ async def _chart_link_deltas(specs: list[ChartSpec]) -> list[str]:
 
 
 def _latest_user_query(items: list[HistoryItem]) -> str:
-    """Most recent user text for source appendix attribution."""
+    """Most recent user text for source appendix attribution.
+
+    Returns:
+        The most recent user text, or an empty string when absent.
+
+    """
     for item in reversed(items):
         if item.role == "user" and item.text:
             return item.text
@@ -1370,12 +1663,17 @@ def _latest_user_query(items: list[HistoryItem]) -> str:
 def _salvage_text(
     text_acc: str, cite_map: CiteMap, emitted: int, *, fully_flushed: bool
 ) -> str | None:
-    """Withheld text releasable on the failure path, or None."""
+    """Withheld text releasable on the failure path, or None.
+
+    Returns:
+        The withheld but releasable text, or None when not salvageable.
+
+    """
     _, still_limit = _classify_accumulated(text_acc)
     if still_limit or fully_flushed:
         return None
     try:
-        salvaged, _ = _render_citations(text_acc, cite_map, final=True)
+        salvaged, _ = render_citations(text_acc, cite_map, final=True)
     except (ValueError, TypeError, KeyError, AttributeError) as exc:
         log.warning("salvage flush failed: %s", exc)
         return None
@@ -1418,7 +1716,12 @@ class _TurnContext:
 
 
 def _validate_request(parsed: ParsedRequest) -> None:
-    """Reject empty or non-user-terminated histories."""
+    """Reject empty or non-user-terminated histories.
+
+    Raises:
+        EngineError: If the history is empty or ends with a non-user turn.
+
+    """
     if not parsed.items:
         message = "no messages"
         raise EngineError(400, message, "invalid_request_error")
@@ -1433,7 +1736,15 @@ def _acquire_attempt_account(
     tried: set[str],
     last_failure: EngineError | None,
 ) -> AccountSession:
-    """Acquire the next untried account or raise the terminal error."""
+    """Acquire the next untried account or raise the terminal error.
+
+    Returns:
+        The next untried account session for the turn.
+
+    Raises:
+        EngineError: If no untried account remains, wrapping the last failure.
+
+    """
     try:
         return pool.acquire(preferred, exclude=tried)
     except NoAccountAvailableError as exc:
@@ -1477,7 +1788,12 @@ def _ingest_parts(
     *,
     is_text_node: bool,
 ) -> Iterator[dict[str, object]]:
-    """Fold stream parts into state, yielding text deltas."""
+    """Fold stream parts into state, yielding text deltas.
+
+    Yields:
+        Text delta event dicts folded from the stream parts.
+
+    """
     for part in parts:
         if isinstance(part, dict):
             ptr = part.get("asset_pointer")
@@ -1504,7 +1820,12 @@ def _ingest_parts(
 def _ingest_event(
     state: _AttemptState, ev: dict[str, Any], acct_email: str
 ) -> Iterator[dict[str, object]]:
-    """Fold one SSE event into state, yielding text deltas."""
+    """Fold one SSE event into state, yielding text deltas.
+
+    Yields:
+        Text delta event dicts folded from one SSE event.
+
+    """
     state.last_event = ev
     if ev.get("conversation_id") and not state.cid:
         state.cid = ev["conversation_id"]
@@ -1513,7 +1834,7 @@ def _ingest_event(
     author = message.get("author") or {}
     if message.get("id"):
         state.last_node_id = message["id"]
-    if author.get("role") not in ("assistant", "tool"):
+    if author.get("role") not in {"assistant", "tool"}:
         return
     content = message.get("content") or {}
     parts = content.get("parts") or []
@@ -1530,7 +1851,7 @@ def _ingest_event(
     if state.limit_hit:
         return
     meta = message.get("metadata") or {}
-    is_completion = meta.get("message_type") in ("next", "continue")
+    is_completion = meta.get("message_type") in {"next", "continue"}
     is_rival_marker = (
         author.get("role") == "assistant"
         and message.get("id")
@@ -1574,11 +1895,16 @@ def _ensure_stream_complete(state: _AttemptState, acct_email: str) -> None:
 
 
 def _flush_attempt_text(state: _AttemptState) -> str | None:
-    """Release withheld reply text at the end of a successful stream."""
+    """Release withheld reply text at the end of a successful stream.
+
+    Returns:
+        The still-withheld tail text, or None when fully emitted.
+
+    """
     # Flush anything still withheld first: short normal replies that
     # begin like the refusal must reach the client in full. final=True
     # also releases citation blocks whose sources never arrived.
-    display, _ = _render_citations(
+    display, _ = render_citations(
         state.text_acc,
         state.cite_map,
         final=True,
@@ -1595,7 +1921,15 @@ def _flush_attempt_text(state: _AttemptState) -> str | None:
 async def _collect_media_deltas(
     state: _AttemptState, acct: AccountSession, parsed: ParsedRequest
 ) -> AsyncIterator[dict[str, object]]:
-    """Yield chart, image, and source deltas for a flushed attempt."""
+    """Yield chart, image, and source deltas for a flushed attempt.
+
+    Yields:
+        Chart, image, and source delta event dicts for a flushed attempt.
+
+    Raises:
+        EngineError: If image delivery failed with no text to deliver instead.
+
+    """
     # genui chart specs -> locally rendered PNG -> freeimage.host link.
     # Any failure degrades to the widget simply being stripped.
     chart_links = await _chart_link_deltas(state.chart_specs)
@@ -1635,7 +1969,12 @@ async def _collect_media_deltas(
 async def _pump_stream_events(
     acct: AccountSession, state: _AttemptState, req: _StreamRequest
 ) -> AsyncIterator[dict[str, object]]:
-    """Stream one attempt's SSE events into state, yielding deltas."""
+    """Stream one attempt's SSE events into state, yielding deltas.
+
+    Yields:
+        Text delta event dicts from one attempt's SSE stream.
+
+    """
     async for ev in acct.stream_conversation(
         prompt_text=req.prompt,
         media=req.media,
@@ -1652,7 +1991,12 @@ async def _pump_stream_events(
 async def _emit_tail_deltas(
     state: _AttemptState, acct: AccountSession, parsed: ParsedRequest
 ) -> AsyncIterator[dict[str, object]]:
-    """Yield flush, media, and source deltas for a completed attempt."""
+    """Yield flush, media, and source deltas for a completed attempt.
+
+    Yields:
+        Flush, media, and source delta event dicts for a completed attempt.
+
+    """
     flushed = _flush_attempt_text(state)
     if flushed is not None:
         yield {"type": "delta", "text": flushed}
@@ -1663,7 +2007,12 @@ async def _emit_tail_deltas(
 def _record_done(
     acct: AccountSession, turn: _TurnContext, state: _AttemptState
 ) -> dict[str, object]:
-    """Persist turn state and build the done event for a success."""
+    """Persist turn state and build the done event for a success.
+
+    Returns:
+        The done event carrying the persisted turn result.
+
+    """
     parsed = turn.parsed
     new_ref = ConvRef(
         acct.identity,
@@ -1724,15 +2073,68 @@ class _StreamRequest:
 
 
 def _initial_preference(ref: ConvRef | None, preferred_email: str | None) -> str | None:
-    """Account preferred for the first attempt of a turn."""
+    """Account preferred for the first attempt of a turn.
+
+    Returns:
+        The stored owner or requested email, or None by default.
+
+    """
     if ref is not None:
         return ref.account_identity
     return preferred_email or None
 
 
 def _untried_count(pool: AccountPool, tried: set[str]) -> int:
-    """Available accounts not yet tried this turn."""
+    """Available accounts not yet tried this turn.
+
+    Returns:
+        The count of available accounts not yet tried this turn.
+
+    """
     return sum(1 for acct in pool.available() if acct.identity not in tried)
+
+
+async def _attempt_deltas(
+    acct: AccountSession,
+    state: _AttemptState,
+    turn: _TurnContext,
+    *,
+    continuing: bool,
+) -> AsyncIterator[dict[str, object]]:
+    """Stream one account attempt, yielding its model and delta events.
+
+    Yields:
+        The model announcement and text delta event dicts for the attempt.
+
+    """
+    parsed = turn.parsed
+    ref = turn.ref
+    acct.total_requests += 1
+    live = _live_slugs(await acct.models())
+    state.model = map_model(parsed.model_requested, live)
+    yield {"type": "model", "model": state.model}
+    prompt, pointers, attachments = await _prepare_attempt(
+        acct, parsed, ref, turn.hashes, turn.previous_response_id
+    )
+    if continuing and ref is not None:
+        parent_hint = ref.parent_id
+        conv_hint = ref.conversation_id
+    else:
+        parent_hint = str(uuid.uuid4())
+        conv_hint = None
+    req = _StreamRequest(
+        prompt=prompt,
+        media=StreamMedia(image_pointers=pointers, attachments=attachments),
+        parent_id=parent_hint,
+        conversation_id=conv_hint,
+    )
+    async for delta in _pump_stream_events(acct, state, req):
+        yield delta
+    _ensure_stream_complete(state, acct.email)
+    async for delta in _emit_tail_deltas(state, acct, parsed):
+        yield delta
+    state.created = int(time.time())
+    yield _record_done(acct, turn, state)
 
 
 async def run_turn(
@@ -1750,6 +2152,13 @@ async def run_turn(
     fresh one and replay the FULL client context: every turn's text plus that
     turn's images and file attachments, re-uploaded to whichever account
     actually serves the attempt -- so failover never loses content.
+
+    Yields:
+        Model, text delta, and done event dicts for the turn.
+
+    Raises:
+        EngineError: If the request is invalid or every account failed.
+
     """
     _validate_request(parsed)
 
@@ -1782,30 +2191,10 @@ async def run_turn(
         continuing = ref is not None and acct.identity == ref.account_identity
         state = _AttemptState()
         try:
-            acct.total_requests += 1
-            live = _live_slugs(await acct.models())
-            state.model = map_model(parsed.model_requested, live)
-            yield {"type": "model", "model": state.model}
-            prompt, pointers, attachments = await _prepare_attempt(
-                acct, parsed, ref, hashes, previous_response_id
-            )
-
-            parent_hint = ref.parent_id if continuing else str(uuid.uuid4())
-            conv_hint = ref.conversation_id if continuing else None
-            req = _StreamRequest(
-                prompt=prompt,
-                media=StreamMedia(image_pointers=pointers, attachments=attachments),
-                parent_id=parent_hint,
-                conversation_id=conv_hint,
-            )
-            async for delta in _pump_stream_events(acct, state, req):
+            async for delta in _attempt_deltas(
+                acct, state, turn, continuing=continuing
+            ):
                 yield delta
-
-            _ensure_stream_complete(state, acct.email)
-            async for delta in _emit_tail_deltas(state, acct, parsed):
-                yield delta
-            state.created = int(time.time())
-            yield _record_done(acct, turn, state)
         except (
             ChatGPTError,
             EngineError,
@@ -1822,7 +2211,7 @@ async def run_turn(
             if isinstance(exc, EngineError) and (
                 exc.error_type == "invalid_request_error"
             ):
-                raise
+                raise EngineError(exc.status, exc.message, exc.error_type) from exc
             failure = _failure_for(exc, acct, pool)
             if state.produced:
                 salvaged = _salvage_text(
@@ -1856,7 +2245,15 @@ async def collect(
     previous_response_id: str | None = None,
     preferred_email: str | None = None,
 ) -> TurnResult:
-    """Non-streaming convenience wrapper."""
+    """Non-streaming convenience wrapper.
+
+    Returns:
+        The turn result from the completed non-streaming turn.
+
+    Raises:
+        EngineError: If the stream ended without producing a result.
+
+    """
     result: TurnResult | None = None
     async for ev in run_turn(
         parsed,

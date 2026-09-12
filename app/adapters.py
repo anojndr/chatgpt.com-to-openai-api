@@ -22,13 +22,14 @@ from . import config as cfg
 
 LIVE_SLUG_ALIASES: dict[str, list[str]] = {
     # incoming name -> candidate chatgpt slugs (first match against live list wins)
-    "gpt-4o": ["gpt-4o"],
-    "gpt-4o-mini": ["gpt-4o-mini"],
-    "gpt-4": ["gpt-4"],
-    "gpt-4.1": ["gpt-4-1"],
-    "gpt-5": ["gpt-5", "gpt-5-5", "auto"],
-    "gpt-5.5": ["gpt-5-5"],
+    "gpt-4o": ["gpt-5-6", "gpt-5-5", "auto"],
+    "gpt-4o-mini": ["gpt-5-6-mini", "gpt-5-5-mini", "auto"],
+    "gpt-4": ["gpt-5-6", "gpt-5-5", "auto"],
+    "gpt-4.1": ["gpt-5-6", "gpt-5-5", "auto"],
+    "gpt-5": ["gpt-5-6", "gpt-5-5", "auto"],
+    "gpt-5.5": ["gpt-5-5", "gpt-5-6", "auto"],
     "gpt-5.6": ["gpt-5-6", "auto"],
+    "gpt-6": ["gpt-6-astra-wm", "gpt-5-6", "auto"],
     "chatgpt-auto": ["auto"],
     "auto": ["auto"],
 }
@@ -38,7 +39,12 @@ MAX_REMOTE_BYTES = 25 * 1024 * 1024
 
 
 def map_model(requested: str | None, live_slugs: set[str]) -> str:
-    """Map a requested model name to a live ChatGPT slug."""
+    """Map a requested model name to a live ChatGPT slug.
+
+    Returns:
+        The live slug to use for the request.
+
+    """
     if not requested:
         return config_default(live_slugs)
     r = requested.strip().lower()
@@ -54,7 +60,12 @@ def map_model(requested: str | None, live_slugs: set[str]) -> str:
 
 
 def config_default(live_slugs: set[str]) -> str:
-    """Return the configured default model when live, else auto."""
+    """Return the configured default model when live, else auto.
+
+    Returns:
+        The configured default slug when live, otherwise "auto".
+
+    """
     d = cfg.DEFAULT_MODEL
     if d in live_slugs:
         return d
@@ -64,7 +75,12 @@ def config_default(live_slugs: set[str]) -> str:
 def public_models(
     models_payload: list[dict[str, object]],
 ) -> list[dict[str, object]]:
-    """Build an OpenAI-style model list from live ChatGPT slugs plus auto."""
+    """Build an OpenAI-style model list from live ChatGPT slugs plus auto.
+
+    Returns:
+        OpenAI-style model dicts for each known slug plus "auto".
+
+    """
     seen: list[str] = []
     for model in models_payload:
         slug = model.get("slug")
@@ -112,7 +128,12 @@ class HistoryItem:
     files: list[FileInput] = field(default_factory=list)
 
     def canon(self) -> str:
-        """Return stable canonical text including attachment descriptors."""
+        """Return stable canonical text including attachment descriptors.
+
+        Returns:
+            Canonical text with attachment descriptors appended.
+
+        """
         extras = [f"img:{im.filename}:{len(im.data)}" for im in self.images]
         extras.extend(f"file:{f.filename}:{len(f.data)}" for f in self.files)
         if extras:
@@ -252,7 +273,15 @@ EXT_TO_LANG: dict[str, str] = {
 
 
 def decode_data_url(value: str) -> tuple[str, bytes]:
-    """Split a data: URL into its mime type and raw bytes."""
+    """Split a data: URL into its mime type and raw bytes.
+
+    Returns:
+        Tuple of mime type and decoded raw bytes.
+
+    Raises:
+        ValueError: If the value is not a valid data URL.
+
+    """
     match = _DATA_URL_RE.match(value.strip())
     if not match:
         msg = "expected a data: URL"
@@ -267,9 +296,17 @@ def decode_data_url(value: str) -> tuple[str, bytes]:
 
 
 async def fetch_remote(url: str) -> tuple[str, bytes]:
-    """Fetch a remote image URL, refusing SSRF targets."""
+    """Fetch a remote image URL, refusing SSRF targets.
+
+    Returns:
+        Tuple of media type and response body bytes.
+
+    Raises:
+        ValueError: If the URL is unsupported, unresolvable, refused, or too large.
+
+    """
     parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
+    if parsed.scheme not in {"http", "https"}:
         msg = "only http(s) image URLs are supported"
         raise ValueError(msg)
     host = parsed.hostname or ""
@@ -291,7 +328,7 @@ async def fetch_remote(url: str) -> tuple[str, bytes]:
     except socket.gaierror as e:
         msg = f"cannot resolve image host: {host}"
         raise ValueError(msg) from e
-    if bad_ip or host in ("localhost", "metadata.google.internal"):
+    if bad_ip or host in {"localhost", "metadata.google.internal"}:
         msg = "refusing to fetch image from private address"
         raise ValueError(msg)
 
@@ -316,7 +353,12 @@ async def fetch_remote(url: str) -> tuple[str, bytes]:
 
 
 def is_textual(mime: str, filename: str) -> bool:
-    """Check whether an attachment should be inlined as text."""
+    """Check whether an attachment should be inlined as text.
+
+    Returns:
+        True when the attachment should be inlined as text.
+
+    """
     if mime in TEXTUAL_MIMES or mime.startswith(TEXTUAL_MIME_PREFIXES):
         return True
     ext = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
@@ -324,13 +366,23 @@ def is_textual(mime: str, filename: str) -> bool:
 
 
 def guess_mime(filename: str, fallback: str = "application/octet-stream") -> str:
-    """Guess a filename's mime type, returning the fallback when unknown."""
+    """Guess a filename's mime type, returning the fallback when unknown.
+
+    Returns:
+        The guessed mime type or the fallback.
+
+    """
     mt, _ = mimetypes.guess_type(filename)
     return mt or fallback
 
 
 def fence(filename: str, data: bytes) -> str:
-    """Wrap file bytes as a labeled markdown code block."""
+    """Wrap file bytes as a labeled markdown code block.
+
+    Returns:
+        Markdown code block labeled with the filename.
+
+    """
     ext = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     lang = EXT_TO_LANG.get(ext, "")
     try:
@@ -342,7 +394,12 @@ def fence(filename: str, data: bytes) -> str:
 
 
 def extract_text(content: object) -> str:
-    """Collect plain text from OpenAI message content."""
+    """Collect plain text from OpenAI message content.
+
+    Returns:
+        The collected plain text.
+
+    """
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -361,36 +418,72 @@ def extract_text(content: object) -> str:
 
 
 def _optional_str(value: object) -> str | None:
-    """Return the value when it is a string, else None."""
+    """Return the value when it is a string, else None.
+
+    Returns:
+        The value if it is a string, otherwise None.
+
+    """
     return value if isinstance(value, str) else None
 
 
 def _optional_bool(value: object) -> bool | None:
-    """Return the value when it is a bool, else None."""
+    """Return the value when it is a bool, else None.
+
+    Returns:
+        The value if it is a bool, otherwise None.
+
+    """
     return value if isinstance(value, bool) else None
 
 
 def _require_str(value: object, message: str) -> str:
-    """Return the value when it is a string, raising ValueError otherwise."""
+    """Return the value when it is a string, raising ValueError otherwise.
+
+    Returns:
+        The value as a string.
+
+    Raises:
+        ValueError: If the value is not a string.
+
+    """
     if isinstance(value, str):
         return value
     raise ValueError(message)
 
 
 def _is_dict(value: object) -> TypeGuard[dict[str, object]]:
-    """Check whether the value is a string-keyed mapping."""
+    """Check whether the value is a string-keyed mapping.
+
+    Returns:
+        True when the value is a dict.
+
+    """
     return isinstance(value, dict)
 
 
 def _require_dict(value: object, message: str) -> dict[str, object]:
-    """Return the value when it is a dict, raising ValueError otherwise."""
+    """Return the value when it is a dict, raising ValueError otherwise.
+
+    Returns:
+        The value as a string-keyed dict.
+
+    Raises:
+        ValueError: If the value is not a dict.
+
+    """
     if _is_dict(value):
         return value
     raise ValueError(message)
 
 
 async def _load_image_bytes(url: str) -> tuple[str, bytes] | None:
-    """Decode image bytes from a data: or http(s) URL, else None."""
+    """Decode image bytes from a data: or http(s) URL, else None.
+
+    Returns:
+        Tuple of mime type and raw bytes, or None for unsupported schemes.
+
+    """
     if url.startswith("data:"):
         return decode_data_url(url)
     if url.startswith(("http://", "https://")):
@@ -399,7 +492,15 @@ async def _load_image_bytes(url: str) -> tuple[str, bytes] | None:
 
 
 async def _chat_image_url(url: str) -> ImageInput:
-    """Build an image input from a chat image_url URL."""
+    """Build an image input from a chat image_url URL.
+
+    Returns:
+        The decoded image input.
+
+    Raises:
+        ValueError: If the URL scheme is not data or http(s).
+
+    """
     loaded = await _load_image_bytes(url)
     if loaded is None:
         msg = "image_url must be a data or http(s) URL"
@@ -441,7 +542,12 @@ def _attach_chat_file(
 
 
 async def _apply_chat_part(item: HistoryItem, texts: list[str], part: object) -> None:
-    """Fold one chat content part into text and attachment buffers."""
+    """Fold one chat content part into text and attachment buffers.
+
+    Raises:
+        ValueError: If the part type is unsupported, such as audio input.
+
+    """
     if isinstance(part, str):
         texts.append(part)
         return
@@ -465,7 +571,12 @@ async def _apply_chat_part(item: HistoryItem, texts: list[str], part: object) ->
 
 
 async def _parse_chat_user(content: object) -> HistoryItem:
-    """Build a user turn from chat message content."""
+    """Build a user turn from chat message content.
+
+    Returns:
+        The parsed user history item.
+
+    """
     item = HistoryItem(role="user")
     if isinstance(content, str):
         item.text = content
@@ -482,11 +593,19 @@ async def _parse_chat_user(content: object) -> HistoryItem:
 async def _parse_chat_message(
     msg: dict[str, object], system_parts: list[str]
 ) -> HistoryItem | None:
-    """Parse one chat message, appending system text and returning the turn."""
+    """Parse one chat message, appending system text and returning the turn.
+
+    Returns:
+        The parsed history item, or None for system messages.
+
+    Raises:
+        ValueError: If the message uses an unsupported role or tool calls.
+
+    """
     role_raw = msg.get("role")
     role = role_raw if isinstance(role_raw, str) else ""
     content = msg.get("content")
-    if role in ("system", "developer"):
+    if role in {"system", "developer"}:
         system_parts.append(extract_text(content))
         return None
     if role == "tool":
@@ -505,7 +624,15 @@ async def _parse_chat_message(
 
 
 async def parse_chat_request(body: dict[str, object]) -> ParsedRequest:
-    """Parse an OpenAI Chat Completions body into internal turns."""
+    """Parse an OpenAI Chat Completions body into internal turns.
+
+    Returns:
+        The normalized parsed request.
+
+    Raises:
+        ValueError: If messages are missing, empty, or contain only system text.
+
+    """
     raw_messages = body.get("messages")
     if not isinstance(raw_messages, list) or not raw_messages:
         msg = "messages must not be empty"
@@ -536,7 +663,15 @@ async def parse_chat_request(body: dict[str, object]) -> ParsedRequest:
 
 
 async def _response_image(part: dict[str, object]) -> ImageInput:
-    """Build an image input from a Responses input_image part."""
+    """Build an image input from a Responses input_image part.
+
+    Returns:
+        The decoded image input.
+
+    Raises:
+        ValueError: If the part references a server file or lacks a usable URL.
+
+    """
     url_raw = part.get("image_url")
     file_id = part.get("file_id")
     if file_id and not url_raw:
@@ -573,7 +708,7 @@ async def _apply_response_part(
         return
     checked = _require_dict(part, "message content parts must be strings or objects")
     part_type = checked.get("type")
-    if part_type in ("input_text", "output_text", "text", "summary_text"):
+    if part_type in {"input_text", "output_text", "text", "summary_text"}:
         text_raw = checked.get("text", "")
         texts.append(text_raw if isinstance(text_raw, str) else "")
     elif part_type == "input_image":
@@ -590,8 +725,13 @@ async def _append_response_message(
     role: object,
     content: object,
 ) -> str:
-    """Append one Responses message; system roles extend system text."""
-    if role in ("system", "developer"):
+    """Append one Responses message; system roles extend system text.
+
+    Returns:
+        The updated system text.
+
+    """
+    if role in {"system", "developer"}:
         return (system_text + "\n\n" + extract_text(content)).strip()
     item = HistoryItem(role="user" if role != "assistant" else "assistant")
     if isinstance(content, str):
@@ -608,7 +748,15 @@ async def _append_response_message(
 async def _apply_response_entry(
     items: list[HistoryItem], system_text: str, entry: object
 ) -> str:
-    """Fold one Responses input entry into items, returning system text."""
+    """Fold one Responses input entry into items, returning system text.
+
+    Returns:
+        The updated system text.
+
+    Raises:
+        ValueError: If the entry type is not supported.
+
+    """
     if isinstance(entry, str):
         items.append(HistoryItem(role="user", text=entry))
         return system_text
@@ -626,7 +774,15 @@ async def _apply_response_entry(
 async def parse_responses_request(
     body: dict[str, object],
 ) -> tuple[ParsedRequest, str | None, bool]:
-    """Parse a Responses body, returning (parsed, previous id, store flag)."""
+    """Parse a Responses body, returning (parsed, previous id, store flag).
+
+    Returns:
+        Tuple of parsed request, previous response id, and store flag.
+
+    Raises:
+        ValueError: If the input is missing or empty.
+
+    """
     instructions = body.get("instructions")
     system_text = instructions if isinstance(instructions, str) else ""
     prev_raw = body.get("previous_response_id")
@@ -656,15 +812,30 @@ async def parse_responses_request(
 
 
 def gen_id(prefix: str) -> str:
-    """Generate a prefixed hex id."""
+    """Generate a prefixed hex id.
+
+    Returns:
+        The generated id string.
+
+    """
     return prefix + uuid.uuid4().hex
 
 
 def now_ts() -> int:
-    """Return the current Unix timestamp in seconds."""
+    """Return the current Unix timestamp in seconds.
+
+    Returns:
+        The current Unix timestamp in seconds.
+
+    """
     return int(time.time())
 
 
 def estimate_tokens(*texts: str) -> int:
-    """Estimate token count for the given texts at ~4 chars per token."""
+    """Estimate token count for the given texts at ~4 chars per token.
+
+    Returns:
+        The estimated token count.
+
+    """
     return sum(len(t) for t in texts) // 4
