@@ -238,7 +238,7 @@ def _conversation_body(
 
     """
     raw_pointers = media.image_pointers if media else None
-    image_pointers = [p for p in (raw_pointers or []) if isinstance(p, dict)]
+    image_pointers = list(raw_pointers) if raw_pointers else []
     parts: list[str | dict[str, Any]] = ([prompt_text] if prompt_text else []) + (
         image_pointers
     )

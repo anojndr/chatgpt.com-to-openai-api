@@ -667,8 +667,6 @@ def _clean_url(url: str) -> str:
     # Split the raw query instead of round-tripping through parse_qsl:
     # re-encoding survivors corrupts values (semicolon pairs collapse,
     # invalid-UTF-8 escapes get replaced, %20 becomes '+').
-    if not isinstance(url, str):
-        return ""
     if any(ord(ch) < ASCII_CONTROL_LIMIT or ord(ch) == ASCII_DELETE_CODE for ch in url):
         return ""
     try:
@@ -701,8 +699,6 @@ def _format_source(src: CiteSource) -> str:
         One citation as a markdown link, bare label, or bare URL.
 
     """
-    if not isinstance(src, dict):
-        return ""
     url = _clean_url(src.get("url", ""))
     label = " ".join(_opt_str(src.get("title")).split())
     if not label:
@@ -783,8 +779,6 @@ def _source_appendix(sources: list[CiteSource], query: str = "") -> str:
     entries: list[str] = []
     seen_urls: set[str] = set()
     for src in sources[:SOURCE_APPENDIX_MAX]:
-        if not isinstance(src, dict):
-            continue
         raw_url = src.get("url")
         if not isinstance(raw_url, str) or not raw_url.strip():
             continue

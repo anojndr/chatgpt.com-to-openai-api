@@ -8,8 +8,9 @@ PORT=${PORT:-4035}
 LOG="$PWD/server.log"
 BASE_URL="http://127.0.0.1:$PORT/v1"
 
-if [ ! -x .venv/bin/python ]; then
+if ! .venv/bin/python -c "import sys" >/dev/null 2>&1; then
   echo "creating venv..."
+  rm -rf .venv
   if command -v uv >/dev/null 2>&1; then
     uv venv .venv
     uv pip install --python .venv/bin/python -r requirements.txt
@@ -28,12 +29,20 @@ echo "starting server..."
 setsid nohup .venv/bin/python -m app.main > "$LOG" 2>&1 < /dev/null &
 disown 2>/dev/null || true
 
+HEALTHY=0
 for i in $(seq 1 30); do
   if curl -sf "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
+    HEALTHY=1
     break
   fi
   sleep 0.5
 done
+
+if [ "$HEALTHY" -ne 1 ]; then
+  echo "Error: Server failed to start. Last log lines:" >&2
+  tail -n 20 "$LOG" >&2 || true
+  exit 1
+fi
 
 echo
 echo "Base URL (copy & paste):"

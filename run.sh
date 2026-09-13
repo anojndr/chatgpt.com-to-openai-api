@@ -3,8 +3,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-if [ ! -x .venv/bin/python ]; then
+if ! .venv/bin/python -c "import sys" >/dev/null 2>&1; then
   echo "creating venv..."
+  rm -rf .venv
   if command -v uv >/dev/null 2>&1; then
     uv venv .venv
     uv pip install --python .venv/bin/python -r requirements.txt
