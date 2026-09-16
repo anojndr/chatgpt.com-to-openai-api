@@ -33,6 +33,7 @@ from app.chatgpt import AccountSession
 from app.engine import (
     EngineError,
     TurnResult,
+    collect,
     jsx_cite_cut,
     render_citations,
     run_turn,
@@ -423,6 +424,88 @@ class TestBranchContinuation(unittest.TestCase):
                 asyncio.run(run(branched))
                 assert len(acct.prompts) == EXPECTED_TWO_PROMPTS
                 assert acct.prompts[1] == "u3"
+
+
+class TestChainedSnapshotKeepsAssistantTurns(unittest.TestCase):
+    """Chained snapshots must interleave assistant replies for hash matching."""
+
+    @staticmethod
+    async def _collect_result(
+        pool: AccountPool,
+        items: list[HistoryItem],
+        previous_response_id: str | None = None,
+    ) -> TurnResult:
+        """Drain one turn.
+
+        Returns:
+            The completed turn result.
+        """
+        return await collect(
+            ParsedRequest(
+                system_text="",
+                items=items,
+                model_requested="auto",
+                stream=False,
+            ),
+            pool,
+            previous_response_id=previous_response_id,
+        )
+
+    def test_chained_followup_snapshot_alternates_roles(self) -> None:
+        """Verify a previous_response_id follow-up stores user,assistant,..."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationStore(db_path=Path(tmp) / "chain.db")
+            with patch("app.engine.STORE", store):
+                pool = AccountPool()
+                acct = FakeAccount("a", "a@example.com", RACE_EVENTS)
+                pool.register(acct)
+
+                async def run() -> tuple[TurnResult, TurnResult, TurnResult]:
+                    """Run root plus two chained tail-only follow-ups.
+
+                    Returns:
+                        The (root, second, third) turn results.
+                    """
+                    first = await self._collect_result(
+                        pool, [HistoryItem(role="user", text="q1")]
+                    )
+                    second = await self._collect_result(
+                        pool,
+                        [HistoryItem(role="user", text="q2")],
+                        previous_response_id=first.response_id,
+                    )
+                    third = await self._collect_result(
+                        pool,
+                        [HistoryItem(role="user", text="q3")],
+                        previous_response_id=second.response_id,
+                    )
+                    return first, second, third
+
+                first_result, second_result, third_result = asyncio.run(run())
+                snap = store.get_snapshot(third_result.response_id)
+                assert snap is not None
+                assert [item.role for item in snap.items] == [
+                    "user",
+                    "assistant",
+                    "user",
+                    "assistant",
+                    "user",
+                    "assistant",
+                ]
+                assert [item.text for item in snap.items] == [
+                    "q1",
+                    first_result.text,
+                    "q2",
+                    second_result.text,
+                    "q3",
+                    third_result.text,
+                ]
+                assert all(item.text for item in snap.items)
+                assert {item.text for item in snap.items if item.role == "user"} == {
+                    "q1",
+                    "q2",
+                    "q3",
+                }
 
 
 if __name__ == "__main__":

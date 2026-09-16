@@ -2042,6 +2042,14 @@ def _record_done(
         prev_snap = STORE.get_snapshot(turn.previous_response_id)
         if prev_snap is not None:
             snap_sys, snap_items = _chain_context(prev_snap, parsed, turn.hashes)
+    # The snapshot must also carry THIS turn's assistant reply. Chained
+    # callers send only the new user tail, so without this the stored chain
+    # collapses to user,user,...: _chain_context can no longer detect a
+    # resent full history (its base hashes never match), every follow-up
+    # looks new, and the tail keeps growing until ChatGPT rejects it as
+    # input_too_large. Interleave the assistant turn now so the chain stays
+    # user,assistant,user,... for the next _chain_context/_history_hashes.
+    snap_items = [*snap_items, HistoryItem(role="assistant", text=state.text_acc)]
     new_ref = ConvRef(
         acct.identity,
         state.cid,
