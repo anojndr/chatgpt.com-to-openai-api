@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeAlias
@@ -47,6 +48,7 @@ EXPECTED_SINGLE_DELIVERY = 1
 EXPECTED_TWO_PROMPTS = 2
 STREAMED_BRANCH_ID = "ta"
 NO_WITHHOLD = -1
+STICKY_COOLDOWN_SECONDS = 900.0
 
 
 class FakeAccount(AccountSession):
@@ -347,19 +349,22 @@ class TestJsxCitations(unittest.TestCase):
 class CapturingAccount(AccountSession):
     """Account stand-in recording prompts and replaying canned events."""
 
-    def __init__(self, identity: str, email: str, events: list[SSEEvent]) -> None:
+    def __init__(
+        self, identity: str, email: str, events: list[SSEEvent], plan: str = "plus"
+    ) -> None:
         """Create the account with canned events and an empty prompt log."""
         super().__init__({
             "identity": identity,
             "session": {
                 "accessToken": "",
-                "account": {"planType": "plus"},
+                "account": {"planType": plan},
                 "user": {"email": email},
             },
             "cookies": {},
         })
         self._events = events
         self.prompts: list[str] = []
+        self.conv_ids: list[object] = []
 
     @override
     async def models(self) -> list[dict[str, str]]:
@@ -372,7 +377,7 @@ class CapturingAccount(AccountSession):
 
     @override
     async def stream_conversation(
-        self, *, prompt_text: str, **_kwargs: object
+        self, *, prompt_text: str, **kwargs: object
     ) -> AsyncIterator[SSEEvent]:
         """Record the prompt and replay the canned SSE events.
 
@@ -380,6 +385,7 @@ class CapturingAccount(AccountSession):
             Each canned server-sent event in order.
         """
         self.prompts.append(prompt_text)
+        self.conv_ids.append(kwargs.get("conversation_id"))
         for event in self._events:
             yield event
 
@@ -424,6 +430,75 @@ class TestBranchContinuation(unittest.TestCase):
                 asyncio.run(run(branched))
                 assert len(acct.prompts) == EXPECTED_TWO_PROMPTS
                 assert acct.prompts[1] == "u3"
+
+
+class TestStickyFailoverKeepsOwnerContinuation(unittest.TestCase):
+    """Failover replays must not steal the owner's stored conversation."""
+
+    @staticmethod
+    def _sticky_request(texts: list[str]) -> ParsedRequest:
+        """Build a full-history alternating user/assistant request.
+
+        Returns:
+            A full-history request alternating user/assistant roles.
+        """
+        return ParsedRequest(
+            system_text="",
+            items=[
+                HistoryItem(role="user" if i % 2 == 0 else "assistant", text=text)
+                for i, text in enumerate(texts)
+            ],
+            model_requested="auto",
+            stream=False,
+        )
+
+    def test_owner_branch_continues_after_failover_fork(self) -> None:
+        """Verify the owner's next turn resumes its own conversation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConversationStore(db_path=Path(tmp) / "sticky.db")
+            with patch("app.engine.STORE", store):
+                pool = AccountPool()
+                owner = CapturingAccount("a", "a@example.com", RACE_EVENTS)
+                failover = CapturingAccount(
+                    "b", "b@example.com", RACE_EVENTS, plan="free"
+                )
+                pool.register(owner)
+                pool.register(failover)
+
+                async def run() -> TurnResult:
+                    """Run base then forked turns, returning the base result.
+
+                    Returns:
+                        The base turn result holding the recorded reply text.
+                    """
+                    base_result: TurnResult | None = None
+                    async for event in run_turn(self._sticky_request(["u1"]), pool):
+                        if event["type"] == "done":
+                            outcome = event["result"]
+                            if isinstance(outcome, TurnResult):
+                                base_result = outcome
+                    assert base_result is not None
+                    assert owner.prompts[0] == "u1"
+                    assert owner.conv_ids[0] is None
+                    base_text = base_result.text
+                    owner.cooldown_until = time.time() + STICKY_COOLDOWN_SECONDS
+                    async for _ in run_turn(
+                        self._sticky_request(["u1", base_text, "u2-fork"]), pool
+                    ):
+                        pass
+                    assert failover.conv_ids[0] is None
+                    owner.cooldown_until = 0.0
+                    async for _ in run_turn(
+                        self._sticky_request(["u1", base_text, "u3-owner"]), pool
+                    ):
+                        pass
+                    return base_result
+
+                base_result = asyncio.run(run())
+                assert base_result.text
+                assert owner.prompts[-1] == "u3-owner"
+                assert owner.conv_ids[-1] == base_result.conversation_id
+                assert len(failover.prompts) == 1
 
 
 class TestChainedSnapshotKeepsAssistantTurns(unittest.TestCase):

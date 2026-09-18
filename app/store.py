@@ -351,36 +351,67 @@ class ConversationStore:
         return None
 
     def record_turn(self, hashes: list[str], ref: ConvRef) -> None:
-        """Store hash chain entries for turn prefix hashes."""
+        """Store hash chain entries for turn prefix hashes.
+
+        Ownership is sticky: the account that first recorded a prefix keeps
+        it. A later turn served by another account (failover replay) shares
+        those early hashes but lives in a different server-side thread --
+        overwriting them would repoint the owner's live conversation at the
+        fork, so the next genuine continuation would resume the wrong
+        thread with phantom turns. Same-owner re-records still advance
+        (new parent/turns); other-owner writes are skipped entirely.
+        """
         if not hashes:
             return
         now = time.time()
         ref.updated = now
         with self._lock, self._transaction() as conn:
             for h in hashes:
-                conn.execute(
-                    """
-                    INSERT INTO prefixes (
-                        hash, account_identity, conversation_id,
-                        parent_id, turns, updated
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(hash) DO UPDATE SET
-                        account_identity=excluded.account_identity,
-                        conversation_id=excluded.conversation_id,
-                        parent_id=excluded.parent_id,
-                        turns=excluded.turns,
-                        updated=excluded.updated
-                    """,
-                    (
-                        h,
-                        ref.account_identity,
-                        ref.conversation_id,
-                        ref.parent_id,
-                        ref.turns,
-                        ref.updated,
-                    ),
+                cur = conn.execute(
+                    "SELECT account_identity FROM prefixes WHERE hash = ?",
+                    (h,),
                 )
+                row = cur.fetchone()
+                if row is None:
+                    conn.execute(
+                        """
+                        INSERT INTO prefixes (
+                            hash, account_identity, conversation_id,
+                            parent_id, turns, updated
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            h,
+                            ref.account_identity,
+                            ref.conversation_id,
+                            ref.parent_id,
+                            ref.turns,
+                            ref.updated,
+                        ),
+                    )
+                elif row[0] == ref.account_identity:
+                    conn.execute(
+                        """
+                        UPDATE prefixes SET
+                            conversation_id = ?,
+                            parent_id = ?,
+                            turns = ?,
+                            updated = ?
+                        WHERE hash = ?
+                        """,
+                        (
+                            ref.conversation_id,
+                            ref.parent_id,
+                            ref.turns,
+                            ref.updated,
+                            h,
+                        ),
+                    )
+                # Else: foreign-owned prefix shared with another account's
+                # live thread (a failover replay forked it). Leave the
+                # owner's pointer alone so its continuations keep resuming
+                # the right server-side conversation.
 
             # Prune old prefixes if table is large
             cur = conn.execute("SELECT COUNT(*) FROM prefixes")

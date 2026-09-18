@@ -35,6 +35,10 @@ BRANCH_ACCOUNT = "user_1"
 BRANCH_CONVERSATION = "conv_1"
 SECOND_TURN_PARENT = "msg_asst_2"
 FIRST_TURN_PARENT = "msg_asst_1"
+STICKY_OWNER_ACCOUNT = "sticky_owner"
+STICKY_FAILOVER_ACCOUNT = "sticky_failover"
+STICKY_OWNER_CONVERSATION = "conv_sticky_owner"
+STICKY_FAILOVER_CONVERSATION = "conv_sticky_failover"
 
 MODEL_NAME = "gpt-5-4"
 SYSTEM_TEXT = "You are a helpful assistant"
@@ -315,6 +319,61 @@ class TestConversationStoreSqlite(unittest.TestCase):
 
         # Verify that h1 was rolled back and does not exist in prefixes
         assert self.store.find([h1]) is None
+
+    def test_failover_replay_does_not_steal_shared_prefix(self) -> None:
+        """Verify a foreign replay fork leaves the owner's pointer intact."""
+        base = item_hash("", "user", "sticky base")
+        owner_reply = item_hash(base, "assistant", "owner answer")
+        fork_user = item_hash(owner_reply, "user", "failover follow-up")
+        fork_reply = item_hash(fork_user, "assistant", "failover answer")
+        branch_user = item_hash(owner_reply, "user", "owner follow-up")
+        branch_reply = item_hash(branch_user, "assistant", "owner second")
+        self.store.record_turn(
+            [base, owner_reply],
+            ConvRef(
+                account_identity=STICKY_OWNER_ACCOUNT,
+                conversation_id=STICKY_OWNER_CONVERSATION,
+                parent_id="msg_owner_1",
+                turns=PARTIAL_PREFIX_MATCH,
+                updated=time.time(),
+            ),
+        )
+        self.store.record_turn(
+            [base, owner_reply, fork_user, fork_reply],
+            ConvRef(
+                account_identity=STICKY_FAILOVER_ACCOUNT,
+                conversation_id=STICKY_FAILOVER_CONVERSATION,
+                parent_id="msg_failover_2",
+                turns=FULL_PREFIX_MATCH,
+                updated=time.time(),
+            ),
+        )
+        shared = self.store.find([base, owner_reply, branch_user])
+        assert shared is not None
+        assert shared[0] == PARTIAL_PREFIX_MATCH
+        assert shared[1].account_identity == STICKY_OWNER_ACCOUNT
+        assert shared[1].conversation_id == STICKY_OWNER_CONVERSATION
+        fork = self.store.find([base, owner_reply, fork_user, fork_reply])
+        assert fork is not None
+        assert fork[1].account_identity == STICKY_FAILOVER_ACCOUNT
+        assert fork[1].conversation_id == STICKY_FAILOVER_CONVERSATION
+        self.store.record_turn(
+            [base, owner_reply, branch_user, branch_reply],
+            ConvRef(
+                account_identity=STICKY_OWNER_ACCOUNT,
+                conversation_id=STICKY_OWNER_CONVERSATION,
+                parent_id="msg_owner_2",
+                turns=FULL_PREFIX_MATCH + 1,
+                updated=time.time(),
+            ),
+        )
+        joined = self.store.find([base, owner_reply, branch_user, branch_reply])
+        assert joined is not None
+        assert joined[1].account_identity == STICKY_OWNER_ACCOUNT
+        assert joined[1].conversation_id == STICKY_OWNER_CONVERSATION
+        intact = self.store.find([base, owner_reply, fork_user, fork_reply])
+        assert intact is not None
+        assert intact[1].conversation_id == STICKY_FAILOVER_CONVERSATION
 
 
 if __name__ == "__main__":
