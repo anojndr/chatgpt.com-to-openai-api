@@ -30,15 +30,21 @@ FREEIMAGE_BASE_URL: str = os.environ.get(
     "https://freeimage.host",
 ).rstrip("/")
 
-PORT: int = int(os.environ.get("PORT", "4035"))
+PORT: int = int(os.environ.get("CHATGPT_PORT", os.environ.get("PORT", "4035")))
 # Bind to loopback by default so a fresh checkout never exposes the proxy
 # to the local network. Set HOST=0.0.0.0 explicitly to serve LAN clients;
-# the environment always wins over this default.
-HOST: str = os.environ.get("HOST", "127.0.0.1")
+# the environment always wins over this default. Namespaced CHATGPT_HOST
+# first so a sibling bridge's HOST export can never rebind this server.
+HOST: str = os.environ.get("CHATGPT_HOST", os.environ.get("HOST", "127.0.0.1"))
 
-ACCOUNTS_FILE: Path = ROOT / os.environ.get("ACCOUNTS_FILE", "accounts.txt")
-DB_PATH: Path = ROOT / os.environ.get("DB_PATH", "data/conversations.db")
-API_KEY: str = os.environ.get("API_KEY", "")  # optional bearer gate for THIS proxy
+ACCOUNTS_FILE: Path = ROOT / os.environ.get(
+    "CHATGPT_ACCOUNTS_FILE", os.environ.get("ACCOUNTS_FILE", "accounts.txt")
+)
+DB_PATH: Path = ROOT / os.environ.get(
+    "CHATGPT_DB_PATH", os.environ.get("DB_PATH", "data/conversations.db")
+)
+# optional bearer gate for THIS proxy
+API_KEY: str = os.environ.get("CHATGPT_API_KEY", os.environ.get("API_KEY", ""))
 INCLUDE_SOURCES: bool = os.environ.get(
     "CHATGPT_INCLUDE_SOURCES",
     os.environ.get("INCLUDE_SOURCES", "0"),

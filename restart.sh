@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Restart the chatgpt-to-openai-api server: kills any running instance, starts fresh.
 set -euo pipefail
-cd "$(dirname "$0")"
+DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$DIR"
 
-PORT=$(grep -E '^PORT=' .env 2>/dev/null | cut -d= -f2 | tr -d '"' || true)
+PORT=$(grep -E '^CHATGPT_PORT=' .env 2>/dev/null | cut -d= -f2 | tr -d '"' || true)
+PORT=${PORT:-$(grep -E '^PORT=' .env 2>/dev/null | cut -d= -f2 | tr -d '"' || true)}
 PORT=${PORT:-4035}
-LOG="$PWD/server.log"
+LOG="$DIR/server.log"
 BASE_URL="http://127.0.0.1:$PORT/v1"
 
 if ! .venv/bin/python -c "import sys" >/dev/null 2>&1; then
@@ -19,9 +21,29 @@ if ! .venv/bin/python -c "import sys" >/dev/null 2>&1; then
     .venv/bin/pip install -q -r requirements.txt
   fi
 fi
-
 echo "killing any running instance..."
-pkill -f "python -m app.main" 2>/dev/null && sleep 1 || true
+# Scoped to $DIR: match `python -m app.main` processes whose cwd is this repo
+# (a bare `pkill -f "python -m app.main"` would also match any other checkout
+# running the same module). Port kill below is port-exact so it stays safe.
+for _pid in $(pgrep -f "python -m app\.main" || true); do
+  if [ "$(readlink "/proc/$_pid/cwd" 2>/dev/null || true)" = "$DIR" ]; then
+    echo "Stopping server (pid $_pid)..."
+    kill "$_pid" 2>/dev/null || true
+  fi
+done
+sleep 1
+# Free our own port if a manually-started instance squats it.
+if command -v fuser >/dev/null 2>&1; then
+  fuser -k "${PORT}/tcp" >/dev/null 2>&1 || true
+  sleep 1
+fi
+# Wait for the port to free up (max ~10s) before starting.
+for _ in $(seq 1 20); do
+  if ! ss -ltn 2>/dev/null | grep -q ":${PORT} "; then
+    break
+  fi
+  sleep 0.5
+done
 
 echo "starting server..."
 # setsid detaches the server into its own process group so Ctrl-C on this
