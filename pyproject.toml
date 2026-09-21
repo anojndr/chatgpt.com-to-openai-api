@@ -9,6 +9,7 @@ dependencies = [
     "uvicorn[standard]",
     "curl_cffi>=0.7",
     "pillow",
+    "redis>=8.1.0",
 ]
 
 [tool.uv]

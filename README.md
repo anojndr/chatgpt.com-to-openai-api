@@ -134,3 +134,15 @@ Tool/function calling, audio input, assistant tool-call replay, server-side `fil
 ## Limits
 
 Free ChatGPT accounts have small message/image quotas; the pool's cooldowns absorb 429s. The Plus account re-enters rotation fastest. Don't hammer the free accounts with image generation.
+
+### Redis cache (optional)
+
+Set `REDIS_URL=redis://127.0.0.1:6379/0` to enable a read-through cache over
+SQLite for conversation prefixes, response snapshots, and model lists
+(key prefix `c2o:`). SQLite stays authoritative: every Redis miss or failure
+falls back to SQLite and never fails a request; oversize snapshots stay
+SQLite-only. Empty `REDIS_URL` disables Redis entirely. `GET /healthz`
+(probed in a worker thread so slow Redis never stalls requests) reports
+`redis` with `enabled`/`status` always; `latency_ms`/`cache`/`server`
+only when reachable (`status: ok`), `cache` alone when
+`status: unreachable`, and neither when `status: disabled`.

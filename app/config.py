@@ -62,6 +62,24 @@ CONVERSATION_TTL_HOURS: float = float(os.environ.get("CONVERSATION_TTL_HOURS", "
 # SNAPSHOT_STORE_CAP_MB.
 SNAPSHOT_FILE_CAP_MB: int = int(os.environ.get("SNAPSHOT_FILE_CAP_MB", "32"))
 SNAPSHOT_STORE_CAP_MB: int = int(os.environ.get("SNAPSHOT_STORE_CAP_MB", "256"))
+# --- Redis read-through cache for conversation continuity ---
+# Empty REDIS_URL disables Redis entirely (SQLite remains authoritative).
+# When set (e.g. redis://127.0.0.1:6379/0), hot prefix/response lookups are
+# served from Redis with an SQLite fallback; every Redis failure degrades to
+# SQLite and never fails a request. Use rediss:// for TLS and embed the
+# password (redis://:password@host:port/db) when auth/ACLs are configured.
+REDIS_URL: str = os.environ.get("REDIS_URL", "")
+REDIS_KEY_PREFIX: str = os.environ.get("REDIS_KEY_PREFIX", "c2o:")
+REDIS_CONNECT_TIMEOUT: float = float(os.environ.get("REDIS_CONNECT_TIMEOUT", "2"))
+REDIS_SOCKET_TIMEOUT: float = float(os.environ.get("REDIS_SOCKET_TIMEOUT", "5"))
+REDIS_MAX_CONNECTIONS: int = int(os.environ.get("REDIS_MAX_CONNECTIONS", "50"))
+REDIS_TTL_SECONDS: int = int(
+    os.environ.get("REDIS_TTL_SECONDS", str(int(CONVERSATION_TTL_HOURS * 3600)))
+)
+# Snapshots larger than this stay SQLite-only; their metadata is still cached.
+REDIS_SNAPSHOT_MAX_BYTES: int = int(
+    os.environ.get("REDIS_SNAPSHOT_MAX_BYTES", str(256 * 1024))
+)
 
 # --- session keepalive: keep accounts.txt sessions alive indefinitely ---
 # Sweep interval: every account is checked once per tick.

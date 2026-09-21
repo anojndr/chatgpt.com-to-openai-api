@@ -29,6 +29,7 @@ from curl_cffi.requests import AsyncSession
 from curl_cffi.requests.exceptions import RequestException
 
 from . import config, pow_solver
+from .redis_cache import get_cache
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -858,6 +859,10 @@ class AccountSession:
         now = time.time()
         if self._models_cache and now - self._models_cache[0] < MODELS_CACHE_TTL_S:
             return self._models_cache[1]
+        cached = self._models_from_redis()
+        if cached is not None:
+            self._models_cache = (now, cached)
+            return cached
         await self.ensure_token()
         s = await self.http()
         r = await s.get(
@@ -875,8 +880,25 @@ class AccountSession:
             and isinstance(mlist[1], list)
         ):
             mlist = mlist[1]  # some accounts get [timestamp, models[]]
-        self._models_cache = (now, [m for m in (mlist or []) if isinstance(m, dict)])
+        cleaned = [m for m in (mlist or []) if isinstance(m, dict)]
+        self._models_cache = (now, cleaned)
+        self._cache_models(cleaned)
         return self._models_cache[1]
+
+    def _models_from_redis(self) -> list[dict[str, Any]] | None:
+        """Return the Redis-cached model list, or None on miss/failure.
+
+        Returns:
+            The cached model list, or None when uncached.
+        """
+        cache = get_cache()
+        return cache.get_models(self.identity) if cache is not None else None
+
+    def _cache_models(self, models: list[dict[str, Any]]) -> None:
+        """Best-effort cache of the model list (never raises)."""
+        cache = get_cache()
+        if cache is not None:
+            cache.put_models(self.identity, models)
 
     # ---------- files ----------
     async def upload_file(

@@ -10,6 +10,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 import logging
@@ -32,6 +33,7 @@ from .adapters import (
 )
 from .chatgpt import ChatGPTError
 from .engine import EngineError, TurnResult, collect, run_turn
+from .redis_cache import get_cache
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -692,14 +694,51 @@ async def responses_api(
 
 @app.get("/healthz", response_model=None)
 async def healthz() -> dict[str, object]:
-    """Report pool health.
+    """Report pool and Redis cache health.
 
     Returns:
-        The pool health status and available account count.
+        The pool health, account count, and Redis status/summary.
 
     """
     avail = len(POOL.available())
-    return {"status": "ok" if avail else "degraded", "accounts_available": avail}
+    payload: dict[str, object] = {
+        "status": "ok" if avail else "degraded",
+        "accounts_available": avail,
+    }
+    payload["redis"] = await asyncio.to_thread(_redis_health)
+    return payload
+
+
+def _redis_health() -> dict[str, object]:
+    """Probe the shared Redis cache with observability signals.
+
+    Runs in a worker thread (called via ``asyncio.to_thread``) so the sync
+    ping/info round trips never block the event loop. Info is skipped when
+    ping fails so an unreachable Redis costs one timeout, not two.
+
+    Returns:
+        The Redis status, latency, cache counters, and server summary.
+    """
+    cache = get_cache()
+    if cache is None:
+        return {"enabled": False, "status": "disabled"}
+    latency = cache.ping_ms()
+    if latency is None:
+        return {
+            "enabled": True,
+            "status": "unreachable",
+            "cache": cache.stats(),
+        }
+    health: dict[str, object] = {
+        "enabled": True,
+        "status": "ok",
+        "latency_ms": round(latency, 2),
+        "cache": cache.stats(),
+    }
+    summary = cache.info_summary()
+    if summary:
+        health["server"] = summary
+    return health
 
 
 @app.get("/v1/accounts", response_model=None)

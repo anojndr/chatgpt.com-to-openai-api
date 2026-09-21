@@ -7,6 +7,11 @@ items [(role, canonical_text)]. Given a client request with the full history
 match lets us continue the real ChatGPT conversation by sending ONLY the new
 trailing messages instead of re-sending everything. Persisted with SQLite so
 all mappings, references, and snapshots survive restarts.
+
+Hot lookups are served from Redis when configured (``REDIS_URL``): a
+read-through cache over the same prefix/response payloads. SQLite stays
+authoritative -- every Redis miss or failure falls back to SQLite, and every
+write persists to SQLite before populating Redis best-effort.
 """
 
 from __future__ import annotations
@@ -26,9 +31,11 @@ from typing import TYPE_CHECKING
 
 from . import config
 from .adapters import FileInput, HistoryItem, ImageInput
+from .redis_cache import RedisCache, get_cache
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
+
 
 log = logging.getLogger("store")
 
@@ -236,15 +243,149 @@ def _deserialize_snapshot(raw: bytes | str) -> TurnSnapshot | None:
         return None
 
 
+def _coerce_snapshot_bytes(value: object) -> bytes | None:
+    """Coerce a SQLite snapshot cell to bytes.
+
+    Returns:
+        The cell as UTF-8 bytes, or None when absent or non-text.
+    """
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, str):
+        return value.encode("utf-8")
+    if isinstance(value, memoryview):
+        return value.tobytes()
+    return None
+
+
+def _is_plain_int(value: object) -> bool:
+    """Whether a value is a JSON integer (bool excluded).
+
+    Returns:
+        True for int values that are not bool.
+    """
+    return type(value) is int
+
+
+def _is_number(value: object) -> bool:
+    """Whether a value is a JSON number (bool excluded).
+
+    Returns:
+        True for int/float values that are not bool.
+    """
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _prefix_payload(ref: ConvRef) -> dict[str, object]:
+    """Encode a conversation ref as a Redis payload.
+
+    Returns:
+        The conversation ref as a JSON-able dict.
+    """
+    return {
+        "account_identity": ref.account_identity,
+        "conversation_id": ref.conversation_id,
+        "parent_id": ref.parent_id,
+        "turns": ref.turns,
+        "updated": ref.updated,
+    }
+
+
+def _ref_from_payload(payload: dict[str, object]) -> ConvRef | None:
+    """Rebuild a conversation ref from a Redis payload.
+
+    Returns:
+        The conversation ref, or None when the payload is unusable.
+    """
+    account = payload.get("account_identity")
+    conversation = payload.get("conversation_id")
+    parent = payload.get("parent_id")
+    turns = payload.get("turns")
+    updated = payload.get("updated")
+    if (
+        not isinstance(account, str)
+        or not isinstance(conversation, str)
+        or not isinstance(parent, str)
+        or not _is_plain_int(turns)
+        or not _is_number(updated)
+    ):
+        return None
+    turns_int = turns if type(turns) is int else 0
+    updated_num = updated if isinstance(updated, (int, float)) else 0.0
+    return ConvRef(
+        account_identity=account,
+        conversation_id=conversation,
+        parent_id=parent,
+        turns=turns_int,
+        updated=float(updated_num),
+    )
+
+
+def _response_meta(rec: ResponseRecord) -> dict[str, object]:
+    """Encode response metadata as a Redis payload.
+
+    Returns:
+        The response metadata as a JSON-able dict.
+    """
+    return {
+        "account_identity": rec.account_identity,
+        "conversation_id": rec.conversation_id,
+        "parent_id": rec.parent_id,
+        "model": rec.model,
+        "created": rec.created,
+    }
+
+
+def _record_from_meta(
+    response_id: str, meta: dict[str, object], snapshot_raw: bytes | None
+) -> ResponseRecord | None:
+    """Rebuild a response record from cached metadata.
+
+    Returns:
+        The response record, or None when the metadata is unusable.
+    """
+    account = meta.get("account_identity")
+    conversation = meta.get("conversation_id")
+    parent = meta.get("parent_id")
+    model = meta.get("model")
+    created = meta.get("created")
+    if (
+        not isinstance(account, str)
+        or not isinstance(conversation, str)
+        or not isinstance(parent, str)
+        or not isinstance(model, str)
+        or not _is_number(created)
+    ):
+        return None
+    created_num = created if isinstance(created, (int, float)) else 0.0
+    snapshot = _deserialize_snapshot(snapshot_raw) if snapshot_raw is not None else None
+    return ResponseRecord(
+        response_id=response_id,
+        account_identity=account,
+        conversation_id=conversation,
+        parent_id=parent,
+        model=model,
+        created=float(created_num),
+        snapshot=snapshot,
+    )
+
+
 class ConversationStore:
     """SQLite-backed conversation prefix match and response snapshot store."""
 
-    def __init__(self, db_path: Path | str | None = None) -> None:
+    def __init__(
+        self, db_path: Path | str | None = None, cache: RedisCache | None = None
+    ) -> None:
         """Open (creating parent directories) the backing SQLite database."""
         self.db_path = Path(db_path) if db_path is not None else config.DB_PATH
+        self._cache_override = cache
         self._lock = threading.RLock()
         self._local = threading.local()
         self._init_db()
+
+    def _cache(self) -> RedisCache | None:
+        """Return the Redis cache override, else the shared configured cache."""
+        return self._cache_override if self._cache_override is not None else get_cache()
 
     def _get_conn(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)
@@ -330,6 +471,34 @@ class ConversationStore:
         """
         if not hashes:
             return None
+        cached = self._find_cached(hashes)
+        if cached is not None:
+            return cached
+        return self._find_sqlite(hashes)
+
+    def _find_cached(self, hashes: list[str]) -> tuple[int, ConvRef] | None:
+        """Return the longest Redis-cached prefix, or None on miss.
+
+        Returns:
+            The cached matched length and ref, or None when uncached.
+        """
+        cache = self._cache()
+        if cache is None:
+            return None
+        hit = cache.find_prefix(hashes)
+        if hit is None:
+            return None
+        matched, payload = hit
+        ref = _ref_from_payload(payload)
+        return (matched, ref) if ref is not None else None
+
+    def _find_sqlite(self, hashes: list[str]) -> tuple[int, ConvRef] | None:
+        """Return the longest SQLite prefix match, warming Redis on hit.
+
+        Returns:
+            The matched length and conversation ref, or None when no match.
+        """
+        found: tuple[int, ConvRef] | None = None
         with self._lock:
             conn = self._get_conn()
             for k in range(len(hashes), 0, -1):
@@ -340,15 +509,27 @@ class ConversationStore:
                 )
                 row = cur.fetchone()
                 if row is not None:
-                    ref = ConvRef(
-                        account_identity=row[0],
-                        conversation_id=row[1],
-                        parent_id=row[2],
-                        turns=row[3],
-                        updated=row[4],
+                    found = (
+                        k,
+                        ConvRef(
+                            account_identity=row[0],
+                            conversation_id=row[1],
+                            parent_id=row[2],
+                            turns=row[3],
+                            updated=row[4],
+                        ),
                     )
-                    return (k, ref)
-        return None
+                    break
+        if found is not None:
+            self._warm_prefix_cache(hashes[: found[0]], found[1])
+        return found
+
+    def _warm_prefix_cache(self, hashes: list[str], ref: ConvRef) -> None:
+        """Best-effort cache of one SQLite prefix hit (never raises)."""
+        cache = self._cache()
+        if cache is None:
+            return
+        cache.cache_prefixes([(h, _prefix_payload(ref)) for h in hashes])
 
     def record_turn(self, hashes: list[str], ref: ConvRef) -> None:
         """Store hash chain entries for turn prefix hashes.
@@ -366,6 +547,7 @@ class ConversationStore:
         now = time.time()
         ref.updated = now
         with self._lock, self._transaction() as conn:
+            owned: list[str] = []
             for h in hashes:
                 cur = conn.execute(
                     "SELECT account_identity FROM prefixes WHERE hash = ?",
@@ -390,6 +572,7 @@ class ConversationStore:
                             ref.updated,
                         ),
                     )
+                    owned.append(h)
                 elif row[0] == ref.account_identity:
                     conn.execute(
                         """
@@ -408,6 +591,7 @@ class ConversationStore:
                             h,
                         ),
                     )
+                    owned.append(h)
                 # Else: foreign-owned prefix shared with another account's
                 # live thread (a failover replay forked it). Leave the
                 # owner's pointer alone so its continuations keep resuming
@@ -419,6 +603,9 @@ class ConversationStore:
             if count > MAX_PREFIX_ROWS:
                 cutoff = now - config.CONVERSATION_TTL_HOURS * 3600
                 conn.execute("DELETE FROM prefixes WHERE updated < ?", (cutoff,))
+        cache = self._cache()
+        if cache is not None and owned:
+            cache.cache_prefixes([(h, _prefix_payload(ref)) for h in owned])
 
     # ---------- responses API ----------
     def put_response(
@@ -493,6 +680,9 @@ class ConversationStore:
             if count > MAX_RESPONSE_ROWS:
                 cutoff = time.time() - config.CONVERSATION_TTL_HOURS * 3600
                 conn.execute("DELETE FROM responses WHERE created < ?", (cutoff,))
+        cache = self._cache()
+        if cache is not None:
+            cache.put_response(rec.response_id, _response_meta(rec), snap_blob)
 
     def get_response(self, response_id: str) -> ResponseRecord | None:
         """Fetch one response record by id, or None when unknown.
@@ -500,6 +690,37 @@ class ConversationStore:
         Returns:
             The stored response record, or None when unknown.
 
+        """
+        cached = self._get_response_cached(response_id)
+        if cached is not None:
+            return cached
+        return self._get_response_sqlite(response_id)
+
+    def _get_response_cached(self, response_id: str) -> ResponseRecord | None:
+        """Return the Redis-cached response, or None on miss.
+
+        A metadata-only hit (oversize snapshot stayed SQLite-only) falls back
+        to SQLite so the full replayable snapshot is never hidden.
+
+        Returns:
+            The cached response record, or None when uncached.
+        """
+        cache = self._cache()
+        if cache is None or not response_id:
+            return None
+        hit = cache.get_response(response_id)
+        if hit is None:
+            return None
+        meta, snapshot_raw = hit
+        if snapshot_raw is None:
+            return self._get_response_sqlite(response_id)
+        return _record_from_meta(response_id, meta, snapshot_raw)
+
+    def _get_response_sqlite(self, response_id: str) -> ResponseRecord | None:
+        """Return the SQLite response, warming Redis on hit.
+
+        Returns:
+            The stored response record, or None when unknown.
         """
         with self._lock:
             conn = self._get_conn()
@@ -512,8 +733,9 @@ class ConversationStore:
             row = cur.fetchone()
             if row is None:
                 return None
-            snapshot = _deserialize_snapshot(row[6]) if row[6] is not None else None
-            return ResponseRecord(
+            raw = _coerce_snapshot_bytes(row[6])
+            snapshot = _deserialize_snapshot(raw) if raw is not None else None
+            rec = ResponseRecord(
                 response_id=row[0],
                 account_identity=row[1],
                 conversation_id=row[2],
@@ -522,6 +744,10 @@ class ConversationStore:
                 created=row[5],
                 snapshot=snapshot,
             )
+        cache = self._cache()
+        if cache is not None:
+            cache.put_response(response_id, _response_meta(rec), raw)
+        return rec
 
     def get_snapshot(self, response_id: str) -> TurnSnapshot | None:
         """Fetch one response snapshot by id, or None when missing.
@@ -530,6 +756,13 @@ class ConversationStore:
             The stored turn snapshot, or None when missing.
 
         """
+        cache = self._cache()
+        if cache is not None and response_id:
+            raw_cached = cache.get_snapshot(response_id)
+            if raw_cached is not None:
+                snap = _deserialize_snapshot(raw_cached)
+                if snap is not None:
+                    return snap
         with self._lock:
             conn = self._get_conn()
             cur = conn.execute(
@@ -539,7 +772,12 @@ class ConversationStore:
             row = cur.fetchone()
             if row is None or row[0] is None:
                 return None
-            return _deserialize_snapshot(row[0])
+            raw = _coerce_snapshot_bytes(row[0])
+            if raw is None:
+                return None
+        if cache is not None:
+            cache.put_snapshot(response_id, raw)
+        return _deserialize_snapshot(raw)
 
 
 STORE = ConversationStore()

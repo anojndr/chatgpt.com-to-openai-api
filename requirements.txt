@@ -2,3 +2,4 @@ fastapi
 uvicorn[standard]
 curl_cffi>=0.7
 pillow
+redis>=8.1
