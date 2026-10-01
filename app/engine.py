@@ -49,6 +49,7 @@ JSX_CITE_SHORT_MAX = 120
 HTTP_BAD_REQUEST = 400
 HTTP_RATE_LIMITED = 429
 INPUT_TOO_LARGE_MARKER = "input_too_large"
+UPLOAD_LIMIT_MARKER = "limit of file uploads"
 
 
 @dataclass
@@ -1466,6 +1467,29 @@ def _is_input_too_large(text: str) -> bool:
     return INPUT_TOO_LARGE_MARKER in text
 
 
+def _chatgpt_failure_for(exc: ChatGPTError) -> EngineError | None:
+    """Map a backend ChatGPT error to its failover error.
+
+    Returns:
+        The mapped ``EngineError``, or None when no special case matches.
+
+    """
+    if UPLOAD_LIMIT_MARKER in exc.message:
+        # Upload quota throttled by OpenAI: fail upload, keep text chat.
+        msg = "file uploads throttled: fail upload, keep text chat"
+        return EngineError(HTTP_RATE_LIMITED, msg, "rate_limit_error")
+    if exc.status == HTTP_RATE_LIMITED:
+        return EngineError(HTTP_RATE_LIMITED, exc.message, "rate_limit_error")
+    if _is_input_too_large(exc.message):
+        detail = exc.message[:300]
+        message = (
+            f"history too long for ChatGPT ({detail}). "
+            "Start a new conversation or shorten the history"
+        )
+        return EngineError(HTTP_BAD_REQUEST, message, "invalid_request_error")
+    return None
+
+
 def _failure_for(
     exc: BaseException, acct: AccountSession, pool: AccountPool
 ) -> EngineError:
@@ -1480,16 +1504,10 @@ def _failure_for(
         message = str(exc)
         return EngineError(HTTP_RATE_LIMITED, message, "rate_limit_error")
     if isinstance(exc, ChatGPTError):
+        mapped = _chatgpt_failure_for(exc)
+        if mapped is not None:
+            return mapped
         pool.report_status(acct, exc.status)
-        if exc.status == HTTP_RATE_LIMITED:
-            return EngineError(HTTP_RATE_LIMITED, exc.message, "rate_limit_error")
-        if _is_input_too_large(exc.message):
-            detail = exc.message[:300]
-            message = (
-                f"history too long for ChatGPT ({detail}). "
-                "Start a new conversation or shorten the history"
-            )
-            return EngineError(HTTP_BAD_REQUEST, message, "invalid_request_error")
         return EngineError(502, exc.message, "server_error")
     if isinstance(exc, EngineError):
         return exc

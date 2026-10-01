@@ -532,11 +532,12 @@ def _attach_chat_file(
 ) -> None:
     """Decode a chat file part into the attachment buffers."""
     file_raw = part.get("file")
-    file_map = file_raw if isinstance(file_raw, dict) else {}
-    fname_raw = file_map.get("filename") or "file"
+    file_map = file_raw if isinstance(file_raw, dict) else part
+    fname_raw = file_map.get("filename") or part.get("filename") or "file"
     fname = fname_raw if isinstance(fname_raw, str) else "file"
     fd = _require_str(
-        file_map.get("file_data"), "only inline file_data (data URL) is supported"
+        file_map.get("file_data") or part.get("file_data"),
+        "only inline file_data (data URL) is supported",
     )
     _attach_file_data(item, texts, fname, fd)
 
