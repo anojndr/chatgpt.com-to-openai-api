@@ -11,6 +11,7 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hmac
 import json
 import logging
@@ -36,13 +37,20 @@ from .engine import EngineError, TurnResult, collect, run_turn
 from .redis_cache import get_cache
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterator
+    from collections.abc import AsyncGenerator, AsyncIterator, Iterator
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
 log = logging.getLogger("main")
+
+# Idle gap between SSE comment frames (``: ping``) while a turn produces no
+# bytes. Image-generation turns can stall for minutes; without traffic,
+# downstream clients with idle timeouts abort the request before the proxy
+# answers. Comments are valid SSE that OpenAI clients ignore.
+KEEPALIVE_IDLE_SECONDS = 15.0
+KEEPALIVE_PING = ": ping\n\n"
 
 _HTTP_BAD_REQUEST = 400
 _HTTP_BAD_GATEWAY = 502
@@ -220,6 +228,53 @@ async def _turn_events(
         yield {"type": "error", "error": exc}
 
 
+async def keepalive_events(
+    events: AsyncIterator[dict[str, object]],
+) -> AsyncGenerator[dict[str, object] | None]:
+    """Yield turn events, substituting ``None`` for each idle keepalive tick.
+
+    The upstream iterator is pushed one event ahead behind a shielded task,
+    so the idle timeout never cancels into the engine: a slow image
+    generation keeps running while the stream layer emits ``None`` ticks.
+    The caller must consume this wrapper to exhaustion or ``aclose`` it;
+    either path closes ``events``.
+
+    Yields:
+        Turn event dicts, or ``None`` once per idle interval with no event.
+
+    """
+    task: asyncio.Task[dict[str, object] | None] = asyncio.ensure_future(
+        anext(events, None)
+    )
+    try:
+        while True:
+            try:
+                event = await asyncio.wait_for(
+                    asyncio.shield(task), KEEPALIVE_IDLE_SECONDS
+                )
+            except TimeoutError:
+                if task.done():
+                    # Settled in a race with the timeout: deliver the event
+                    # (or raise the upstream error) instead of ticking.
+                    event = task.result()
+                else:
+                    yield None
+                    continue
+            if event is None:
+                return
+            yield event
+            task = asyncio.ensure_future(anext(events, None))
+    finally:
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        aclose = getattr(events, "aclose", None)
+        if aclose is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await aclose()
+
+
 def _chat_done_chunks(
     *,
     cid: str,
@@ -291,6 +346,78 @@ def _chat_done_chunks(
     yield "data: [DONE]\n\n"
 
 
+@dataclass
+class _ChatStreamState:
+    """Mutable cursor for chat chunk framing."""
+
+    cid: str
+    created: int
+    model: str
+    include_usage: bool
+    first: bool = True
+
+
+def _chat_event_chunks(state: _ChatStreamState, ev: dict[str, object]) -> Iterator[str]:
+    """Yield SSE chunks for one turn event, advancing the stream cursor.
+
+    Yields:
+        SSE-encoded chunks for the event (possibly none).
+
+    """
+    etype = ev["type"]
+    if etype == "model":
+        model_name = ev["model"]  # resolved live slug, stamped on chunks
+        if isinstance(model_name, str):
+            state.model = model_name
+    elif etype == "delta":
+        text = ev["text"]
+        if not isinstance(text, str):
+            return
+        # First chunk carries role + any initial content (never drop text).
+        delta = (
+            {"role": "assistant", "content": text} if state.first else {"content": text}
+        )
+        chunk: dict[str, object] = {
+            "id": state.cid,
+            "object": "chat.completion.chunk",
+            "created": state.created,
+            "model": state.model,
+            "system_fingerprint": None,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": delta,
+                    "logprobs": None,
+                    "finish_reason": None,
+                },
+            ],
+        }
+        state.first = False
+        yield _sse(chunk)
+    elif etype == "done":
+        yield from _chat_done_chunks(
+            cid=state.cid,
+            created=state.created,
+            model=state.model,
+            res=ev["result"],
+            include_usage=state.include_usage,
+        )
+    elif etype == "error":
+        # Headers are already sent; deliver the failure in-band so clients
+        # see a well-formed error instead of a truncated stream.
+        err = ev["error"]
+        if isinstance(err, EngineError):
+            yield _sse({
+                "error": {
+                    "message": err.message,
+                    "type": err.error_type,
+                    "param": None,
+                    "code": str(err.status),
+                },
+            })
+        yield "data: [DONE]\n\n"
+
+
 async def chat_stream(
     parsed: ParsedRequest, *, include_usage: bool, preferred: str | None = None
 ) -> AsyncIterator[str]:
@@ -300,63 +427,23 @@ async def chat_stream(
         SSE-encoded chat completion chunks ending with a done sentinel.
 
     """
-    cid = "chatcmpl-" + uuid.uuid4().hex
-    created = int(time.time())
-    model = parsed.model_requested or "auto"
-    first = True
-    async for ev in _turn_events(parsed, preferred=preferred):
-        if ev["type"] == "model":
-            model_name = ev["model"]  # resolved live slug, stamped on chunks
-            if isinstance(model_name, str):
-                model = model_name
-        elif ev["type"] == "delta":
-            t = ev["text"]
-            if not isinstance(t, str):
+    state = _ChatStreamState(
+        cid="chatcmpl-" + uuid.uuid4().hex,
+        created=int(time.time()),
+        model=parsed.model_requested or "auto",
+        include_usage=include_usage,
+    )
+    events = _turn_events(parsed, preferred=preferred)
+    ticked_events = keepalive_events(events)
+    try:
+        async for ticked in ticked_events:
+            if ticked is None:
+                yield KEEPALIVE_PING
                 continue
-            # first chunk carries role + any initial content (never drop text)
-            delta = {"role": "assistant", "content": t} if first else {"content": t}
-            chunk: dict[str, object] = {
-                "id": cid,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "system_fingerprint": None,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": delta,
-                        "logprobs": None,
-                        "finish_reason": None,
-                    },
-                ],
-            }
-            first = False
-            yield _sse(chunk)
-        elif ev["type"] == "done":
-            for chunk in _chat_done_chunks(
-                cid=cid,
-                created=created,
-                model=model,
-                res=ev["result"],
-                include_usage=include_usage,
-            ):
+            for chunk in _chat_event_chunks(state, ticked):
                 yield chunk
-        elif ev["type"] == "error":
-            # headers are already sent; deliver the failure in-band so clients
-            # see a well-formed error instead of a truncated stream
-            err = ev["error"]
-            if isinstance(err, EngineError):
-                yield _sse(
-                    {
-                        "error": {
-                            "message": err.message,
-                            "type": err.error_type,
-                            "param": None,
-                            "code": str(err.status),
-                        },
-                    },
-                )
-            yield "data: [DONE]\n\n"
+    finally:
+        await ticked_events.aclose()
 
 
 @app.post("/v1/chat/completions", response_model=None)
@@ -515,6 +602,159 @@ def _msg_item(
     return item
 
 
+@dataclass
+class _ResponsesStreamState:
+    """Mutable cursor for Responses event framing."""
+
+    rid: str
+    msg_id: str
+    default_model: str
+    prev: str | None
+    seq: int = 0
+    text_acc: str = ""
+    result: TurnResult | None = None
+
+    def frame(self, etype: str, **kw: object) -> str:
+        """Encode one Responses event with the next sequence number.
+
+        Returns:
+            The SSE-encoded Responses event.
+
+        """
+        self.seq += 1
+        payload: dict[str, object] = {"type": etype, "sequence_number": self.seq}
+        payload.update(kw)
+        return _sse(payload)
+
+    def opening_chunks(self) -> Iterator[str]:
+        """Yield the opening Responses envelope events.
+
+        Yields:
+            Opening envelope events (created, in-progress, item/part added).
+
+        """
+        in_prog = _response_resource(
+            self.rid,
+            self.default_model,
+            int(time.time()),
+            self.prev,
+            _ResponseContent(status="in_progress", output_items=[], usage=None),
+        )
+        yield self.frame("response.created", response=in_prog)
+        yield self.frame("response.in_progress", response=in_prog)
+        yield self.frame(
+            "response.output_item.added",
+            output_index=0,
+            item=_msg_item(self.msg_id, "", with_content=False),
+        )
+        yield self.frame(
+            "response.content_part.added",
+            item_id=self.msg_id,
+            output_index=0,
+            content_index=0,
+            part={"type": "output_text", "text": "", "annotations": []},
+        )
+
+    def event_chunks(self, ev: dict[str, object]) -> Iterator[str]:
+        """Yield SSE chunks for one turn event, advancing the cursor.
+
+        Yields:
+            SSE-encoded Responses events for the turn event (possibly none).
+
+        """
+        etype = ev["type"]
+        if etype == "delta":
+            text = ev["text"]
+            if not isinstance(text, str):
+                return
+            self.text_acc += text
+            yield self.frame(
+                "response.output_text.delta",
+                item_id=self.msg_id,
+                output_index=0,
+                content_index=0,
+                delta=text,
+                logprobs=[],
+                obfuscation=None,
+            )
+        elif etype == "done":
+            done_result = ev["result"]
+            if isinstance(done_result, TurnResult):
+                self.result = done_result
+        elif etype == "error":
+            err = ev["error"]
+            if isinstance(err, EngineError):
+                yield self.frame(
+                    "response.failed",
+                    response=_failed_response_resource(
+                        self.rid,
+                        self.default_model,
+                        self.prev,
+                        err.message,
+                        err.error_type,
+                    ),
+                )
+            yield "data: [DONE]\n\n"
+
+    def closing_chunks(self) -> Iterator[str]:
+        """Yield the completed-response envelope events for the stored result.
+
+        Yields:
+            Completed envelope events, or a failed envelope when no result.
+
+        """
+        if self.result is None:
+            yield self.frame(
+                "response.failed",
+                response=_failed_response_resource(
+                    self.rid,
+                    self.default_model,
+                    self.prev,
+                    "engine returned no result",
+                    "server_error",
+                ),
+            )
+            yield "data: [DONE]\n\n"
+            return
+        full_part = {"type": "output_text", "text": self.text_acc, "annotations": []}
+        yield self.frame(
+            "response.output_text.done",
+            item_id=self.msg_id,
+            output_index=0,
+            content_index=0,
+            text=self.text_acc,
+        )
+        yield self.frame(
+            "response.content_part.done",
+            item_id=self.msg_id,
+            output_index=0,
+            content_index=0,
+            part=full_part,
+        )
+        done_item = _msg_item(self.msg_id, self.text_acc, status="completed")
+        yield self.frame("response.output_item.done", output_index=0, item=done_item)
+        final = _response_resource(
+            self.result.response_id,
+            self.result.model,
+            self.result.created,
+            self.prev,
+            _ResponseContent(
+                status="completed",
+                output_items=[done_item],
+                usage={
+                    "input_tokens": self.result.prompt_tokens,
+                    "input_tokens_details": {"cached_tokens": 0},
+                    "output_tokens": self.result.completion_tokens,
+                    "output_tokens_details": {"reasoning_tokens": 0},
+                    "total_tokens": self.result.prompt_tokens
+                    + self.result.completion_tokens,
+                },
+            ),
+        )
+        yield self.frame("response.completed", response=final)
+        yield "data: [DONE]\n\n"
+
+
 async def responses_stream(
     parsed: ParsedRequest, prev: str | None, preferred: str | None = None
 ) -> AsyncIterator[str]:
@@ -524,120 +764,30 @@ async def responses_stream(
         SSE-encoded Responses API events ending with a done sentinel.
 
     """
-    seq = 0
-    rid = "resp_" + uuid.uuid4().hex
-    msg_id = "msg_" + uuid.uuid4().hex
-
-    def ev(etype: str, **kw: object) -> str:
-        nonlocal seq
-        seq += 1
-        payload: dict[str, object] = {"type": etype, "sequence_number": seq}
-        payload.update(kw)
-        return _sse(payload)
-
-    default_model = parsed.model_requested or "auto"
-    in_prog = _response_resource(
-        rid,
-        default_model,
-        int(time.time()),
-        prev,
-        _ResponseContent(status="in_progress", output_items=[], usage=None),
+    state = _ResponsesStreamState(
+        rid="resp_" + uuid.uuid4().hex,
+        msg_id="msg_" + uuid.uuid4().hex,
+        default_model=parsed.model_requested or "auto",
+        prev=prev,
     )
-    yield ev("response.created", response=in_prog)
-    yield ev("response.in_progress", response=in_prog)
-    yield ev(
-        "response.output_item.added",
-        output_index=0,
-        item=_msg_item(msg_id, "", with_content=False),
-    )
-    yield ev(
-        "response.content_part.added",
-        item_id=msg_id,
-        output_index=0,
-        content_index=0,
-        part={"type": "output_text", "text": "", "annotations": []},
-    )
-
-    text_acc = ""
-    result: TurnResult | None = None
-    async for e in _turn_events(parsed, previous_response_id=prev, preferred=preferred):
-        if e["type"] == "delta":
-            text = e["text"]
-            if not isinstance(text, str):
+    for chunk in state.opening_chunks():
+        yield chunk
+    events = _turn_events(parsed, previous_response_id=prev, preferred=preferred)
+    ticked_events = keepalive_events(events)
+    try:
+        async for ticked in ticked_events:
+            if ticked is None:
+                yield KEEPALIVE_PING
                 continue
-            text_acc += text
-            yield ev(
-                "response.output_text.delta",
-                item_id=msg_id,
-                output_index=0,
-                content_index=0,
-                delta=text,
-                logprobs=[],
-                obfuscation=None,
-            )
-        elif e["type"] == "done":
-            done_result = e["result"]
-            if isinstance(done_result, TurnResult):
-                result = done_result
-        elif e["type"] == "error":
-            err = e["error"]
-            if isinstance(err, EngineError):
-                yield ev(
-                    "response.failed",
-                    response=_failed_response_resource(
-                        rid, default_model, prev, err.message, err.error_type
-                    ),
-                )
-            yield "data: [DONE]\n\n"
-            return
-
-    if result is None:
-        yield ev(
-            "response.failed",
-            response=_failed_response_resource(
-                rid, default_model, prev, "engine returned no result", "server_error"
-            ),
-        )
-        yield "data: [DONE]\n\n"
-        return
-
-    full_part = {"type": "output_text", "text": text_acc, "annotations": []}
-    yield ev(
-        "response.output_text.done",
-        item_id=msg_id,
-        output_index=0,
-        content_index=0,
-        text=text_acc,
-    )
-    yield ev(
-        "response.content_part.done",
-        item_id=msg_id,
-        output_index=0,
-        content_index=0,
-        part=full_part,
-    )
-    done_item = _msg_item(msg_id, text_acc, status="completed")
-    yield ev("response.output_item.done", output_index=0, item=done_item)
-
-    final = _response_resource(
-        result.response_id,
-        result.model,
-        result.created,
-        prev,
-        _ResponseContent(
-            status="completed",
-            output_items=[done_item],
-            usage={
-                "input_tokens": result.prompt_tokens,
-                "input_tokens_details": {"cached_tokens": 0},
-                "output_tokens": result.completion_tokens,
-                "output_tokens_details": {"reasoning_tokens": 0},
-                "total_tokens": result.prompt_tokens + result.completion_tokens,
-            },
-        ),
-    )
-    yield ev("response.completed", response=final)
-    yield "data: [DONE]\n\n"
+            failed = ticked["type"] == "error"
+            for chunk in state.event_chunks(ticked):
+                yield chunk
+            if failed:
+                return
+    finally:
+        await ticked_events.aclose()
+    for chunk in state.closing_chunks():
+        yield chunk
 
 
 @app.post("/v1/responses", response_model=None)
